@@ -1,6 +1,10 @@
 #!/bin/bash
 
 # tar and compress using zstd with 19 as default quality
+# Example usage:
+#   ./tarzstd.sh -q 3 file1 file2 folder1
+#   ./tarzstd.sh file1
+#   ./tarzstd.sh *
 
 # Default compression quality
 quality=19
