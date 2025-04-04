@@ -4,7 +4,9 @@
 # Example usage:
 #   ./tarzstd.sh -q 3 file1 file2 folder1
 #   ./tarzstd.sh file1
-#   ./tarzstd.sh *
+#   ./tarzstd.sh *     # archive files and folders excluding hidden ones
+#   ./tarzstd.sh .* * # archive all files and folders including hidden ones
+#   ./tarzstd.sh {.,}* # same as above, but using fish wildcard globbing
 
 # Default compression quality
 quality=19
