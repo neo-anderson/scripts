@@ -101,12 +101,12 @@
             </div>
             <div style="margin-bottom: 10px; padding-bottom: 10px; border-bottom: 1px solid #444;">
                 <label style="cursor: pointer; display: flex; align-items: center; gap: 5px; font-size: 11px; margin-bottom: 6px;">
-                    <input type="checkbox" id="cb-default-model" style="cursor: pointer; margin: 0;">
+                    <input type="checkbox" id="cb-default-model" checked style="cursor: pointer; margin: 0;">
                     Use default model when missing
                 </label>
                 <div style="display: flex; align-items: center; gap: 5px; font-size: 11px;">
                     <span>ai:model:</span>
-                    <input type="text" id="inp-default-model" value="${DEFAULT_MODEL_NAME}" disabled
+                    <input type="text" id="inp-default-model" value="${DEFAULT_MODEL_NAME}"
                         style="flex: 1; min-width: 0; background: #222; color: #fff; border: 1px solid #555; border-radius: 3px; padding: 2px 4px; font-family: monospace; font-size: 11px;">
                 </div>
             </div>
@@ -155,7 +155,6 @@
         defaultModelInp.disabled = !defaultModelCb.checked;
         defaultModelInp.parentElement.style.opacity = defaultModelCb.checked ? '1' : '0.4';
     });
-    defaultModelInp.parentElement.style.opacity = '0.4';
 
     const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
