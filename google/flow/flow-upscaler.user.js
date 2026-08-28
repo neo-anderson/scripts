@@ -3,7 +3,7 @@
 // @namespace   Violentmonkey Scripts
 // @match       https://labs.google/fx/tools/flow/project/*
 // @grant       none
-// @version     1.8
+// @version     1.9
 // ==/UserScript==
 
 // JSON sidecar instead of ⁠.txt + ⁠.md — a single ⁠image-filename.ext.json is written per image via the new ⁠buildJson(), producing exactly your target shape:
@@ -26,7 +26,7 @@
 //     "2.Created: Jun 22, 2026"
 //   ]
 // }
-// **"Download default 1K only"** checkbox and a **minimize/expand** toggle for the panel.
+// **Separate toggles for downloading 2K upscaled & default 1K** (both enabled by default) and a **minimize/expand** toggle for the panel.
 // default model and offset options on the panel.
 // bulk delete
 
@@ -91,12 +91,12 @@
             </div>
             <div style="margin-bottom: 10px; padding-bottom: 10px; border-bottom: 1px solid #444;">
                 <label style="cursor: pointer; display: flex; align-items: center; gap: 5px; font-size: 11px; margin-bottom: 6px;">
-                    <input type="checkbox" id="cb-only-1k" style="cursor: pointer; margin: 0;">
-                    Only download default 1K (no upscale)
+                    <input type="checkbox" id="cb-download-2k" checked style="cursor: pointer; margin: 0;">
+                    Download 2K upscaled
                 </label>
                 <label style="cursor: pointer; display: flex; align-items: center; gap: 5px; font-size: 11px;">
-                    <input type="checkbox" id="cb-download-fallback" style="cursor: pointer; margin: 0;">
-                    Download default 1K if 2K fails
+                    <input type="checkbox" id="cb-download-1k" checked style="cursor: pointer; margin: 0;">
+                    Download default 1K
                 </label>
             </div>
             <div style="margin-bottom: 10px; padding-bottom: 10px; border-bottom: 1px solid #444;">
@@ -128,7 +128,7 @@
                 </div>
             </div>
             <button id="btn-upscale-selected" style="width: 100%; padding: 8px; cursor: pointer; background-color: #2196F3; color: white; border: none; border-radius: 4px;">
-                Upscale Selected
+                Upscale / Download Selected
             </button>
             <button id="btn-delete-selected" style="width: 100%; padding: 8px; margin-top: 8px; cursor: pointer; background-color: #F44336; color: white; border: none; border-radius: 4px;">
                 Delete Selected
@@ -147,14 +147,6 @@
         btn.innerText = panelMinimized ? '+' : '–';
         btn.title = panelMinimized ? 'Expand' : 'Minimize';
     };
-
-    // ---- "Only 1K" and "Fallback" are mutually exclusive; grey out fallback when only-1K is on ----
-    const only1kCb = document.getElementById('cb-only-1k');
-    const fallbackCb = document.getElementById('cb-download-fallback');
-    only1kCb.addEventListener('change', () => {
-        fallbackCb.disabled = only1kCb.checked;
-        fallbackCb.parentElement.style.opacity = only1kCb.checked ? '0.4' : '1';
-    });
 
     // ---- Enable/disable the default-model textbox with its checkbox ----
     const defaultModelCb = document.getElementById('cb-default-model');
@@ -376,31 +368,37 @@
             return;
         }
 
-        const only1k = document.getElementById('cb-only-1k').checked;
+        const do2k = document.getElementById('cb-download-2k').checked;
+        const do1k = document.getElementById('cb-download-1k').checked;
+
+        if (!do2k && !do1k) {
+            alert("Please enable at least one download option (2K Upscaled or Default 1K).");
+            return;
+        }
 
         const t = window.__upscale_tokens;
-        // Auth token is only required for the 2K upscale API; 1K-only uses the redirect endpoint.
-        if (!only1k && !t.authToken) {
+        // Auth token is required if 2K upscale is enabled.
+        if (do2k && !t.authToken) {
             alert("Cannot upscale yet! Wait for Auth token to turn green (✅).");
             return;
         }
 
         const btn = document.getElementById('btn-upscale-selected');
-        btn.innerText = `${only1k ? 'Downloading' : 'Upscaling'} 0 / ${checkedBoxes.length}...`;
+        btn.innerText = `Processing 0 / ${checkedBoxes.length}...`;
         btn.style.backgroundColor = '#FFC107';
         btn.disabled = true;
 
         for (let i = 0; i < checkedBoxes.length; i++) {
             const cb = checkedBoxes[i];
             const mediaId = cb.value;
-            btn.innerText = `${only1k ? 'Downloading' : 'Upscaling'} ${i + 1} / ${checkedBoxes.length}...`;
+            btn.innerText = `Processing ${i + 1} / ${checkedBoxes.length}...`;
             console.log(`[Auto-Upscaler] Processing ${mediaId}...`);
 
             // Track outcome of this iteration to pick the right wait afterwards
             let iterationSuccess = false;
 
-            // Only fetch a reCAPTCHA token when we actually hit the upscale API.
-            const freshToken = only1k ? '' : await getFreshRecaptchaToken();
+            // Only fetch a reCAPTCHA token if 2K upscale is requested.
+            const freshToken = do2k ? await getFreshRecaptchaToken() : '';
 
             const makePayload = (resolution) => {
                 const p = {
@@ -477,62 +475,60 @@
             };
 
             try {
-                if (only1k) {
-                    // ---- 1K-only mode: skip the upscale API entirely ----
-                    console.log(`[Auto-Upscaler] 1K-only download for ${mediaId}...`);
-                    const imageFilename = `GoogleFlow_1K_${mediaId}.jpg`;
-                    await downloadUrl(`https://labs.google/fx/api/trpc/media.getMediaUrlRedirect?name=${mediaId}`, imageFilename);
-                    await writeSidecar(imageFilename, false); // 1K -> no ai:upscaled tag
-                    console.log(`[Auto-Upscaler] Success (1K only) for ${mediaId}`);
-                    cb.parentElement.style.backgroundColor = 'rgba(76, 175, 80, 0.8)';
-                    cb.checked = false;
-                    updateSelectedCount();
-                    iterationSuccess = true;
-                } else {
-                    // 1. Try 2K Upscale
-                    let res = await sendRequest(makePayload("UPSAMPLE_IMAGE_RESOLUTION_2K"));
-                    let resolutionUsed = "2K";
+                let success2k = false;
+                let success1k = false;
 
-                    // 2. Fallback to default 1K via redirect if 2K fails AND fallback is checked
-                    const fallbackChecked = document.getElementById('cb-download-fallback').checked;
-                    if (!res.ok) {
-                        if (fallbackChecked) {
-                            console.warn(`[Auto-Upscaler] 2K failed for ${mediaId}, downloading default 1K via redirect...`);
-                            const imageFilename = `GoogleFlow_1K_${mediaId}.jpg`;
-                            await downloadUrl(`https://labs.google/fx/api/trpc/media.getMediaUrlRedirect?name=${mediaId}`, imageFilename);
-                            await writeSidecar(imageFilename, false); // 1K -> no ai:upscaled tag
-                            console.log(`[Auto-Upscaler] Success (1K Fallback) for ${mediaId}`);
-                            cb.parentElement.style.backgroundColor = 'rgba(76, 175, 80, 0.8)';
-                            cb.checked = false;
-                            updateSelectedCount();
-                            iterationSuccess = true; // 1K fallback download counts as success for throttling
-                            res = null; // nullify so we skip the JSON block
+                // 1. Process 2K Upscale if requested
+                if (do2k) {
+                    try {
+                        const res = await sendRequest(makePayload("UPSAMPLE_IMAGE_RESOLUTION_2K"));
+                        if (res && res.ok) {
+                            const data = await res.json();
+                            console.log(`[Auto-Upscaler] 2K Success for ${mediaId}`);
+                            if (data.encodedImage) {
+                                const imageFilename = `GoogleFlow_2K_${mediaId}.jpg`;
+                                downloadBase64(data.encodedImage, imageFilename);
+                                await writeSidecar(imageFilename, true); // 2K success -> ai:upscaled tag
+                            }
+                            success2k = true;
                         } else {
-                            throw new Error(`2K upscale failed and fallback disabled. Server response: ${await res.text()}`);
+                            const errText = res ? await res.text() : 'No response';
+                            console.error(`[Auto-Upscaler] 2K Upscale failed for ${mediaId}:`, errText);
                         }
-                    }
-
-                    if (res && res.ok) {
-                        const data = await res.json();
-                        console.log(`[Auto-Upscaler] Success (${resolutionUsed}) for ${mediaId}`);
-                        if (data.encodedImage) {
-                            const imageFilename = `GoogleFlow_${resolutionUsed}_${mediaId}.jpg`;
-                            downloadBase64(data.encodedImage, imageFilename);
-                            await writeSidecar(imageFilename, true); // 2K success -> ai:upscaled tag
-                        }
-                        cb.parentElement.style.backgroundColor = 'rgba(76, 175, 80, 0.8)';
-                        cb.checked = false; // Uncheck on success
-                        updateSelectedCount();
-                        iterationSuccess = true;
-                    } else if (res && !res.ok) {
-                        const errText = await res.text();
-                        console.error(`[Auto-Upscaler] Final failure for ${mediaId}:`, errText);
-                        cb.parentElement.style.backgroundColor = 'rgba(244, 67, 54, 0.8)';
-                        iterationSuccess = false;
+                    } catch (err2k) {
+                        console.error(`[Auto-Upscaler] 2K Upscale error on ${mediaId}:`, err2k);
                     }
                 }
+
+                // 2. Process Default 1K if requested
+                if (do1k) {
+                    try {
+                        if (do2k && success2k) {
+                            await sleep(400); // brief pause between 2K and 1K downloads for same image
+                        }
+                        console.log(`[Auto-Upscaler] Downloading 1K default for ${mediaId}...`);
+                        const imageFilename = `GoogleFlow_1K_${mediaId}.jpg`;
+                        await downloadUrl(`https://labs.google/fx/api/trpc/media.getMediaUrlRedirect?name=${mediaId}`, imageFilename);
+                        await writeSidecar(imageFilename, false); // 1K -> no ai:upscaled tag
+                        console.log(`[Auto-Upscaler] 1K Success for ${mediaId}`);
+                        success1k = true;
+                    } catch (err1k) {
+                        console.error(`[Auto-Upscaler] 1K Download error on ${mediaId}:`, err1k);
+                    }
+                }
+
+                // Determine overall tile iteration success
+                iterationSuccess = (do2k && success2k) || (do1k && success1k);
+
+                if (iterationSuccess) {
+                    cb.parentElement.style.backgroundColor = 'rgba(76, 175, 80, 0.8)';
+                    cb.checked = false; // Uncheck on success
+                    updateSelectedCount();
+                } else {
+                    cb.parentElement.style.backgroundColor = 'rgba(244, 67, 54, 0.8)';
+                }
             } catch (e) {
-                console.error(`[Auto-Upscaler] Error on ${mediaId}:`, e);
+                console.error(`[Auto-Upscaler] General error on ${mediaId}:`, e);
                 cb.parentElement.style.backgroundColor = 'rgba(244, 67, 54, 0.8)';
                 iterationSuccess = false;
             }
@@ -548,7 +544,7 @@
             }
         }
 
-        btn.innerText = 'Upscale Selected';
+        btn.innerText = 'Upscale / Download Selected';
         btn.style.backgroundColor = '#2196F3';
         btn.disabled = false;
     };
