@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "Reddit Filter",
+  "version": "1.0",
+  "description": "Filter Reddit posts by minimum likes, and quickly save or hide posts.",
+  "permissions": ["storage"],
+  "host_permissions": ["*://*.reddit.com/*"],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*.reddit.com/*"],
+      "css": ["styles.css"],
+      "js": ["content.js"]
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <h3>Reddit Filter</h3>
+
+  <label for="minLikes">Minimum Likes:</label>
+  <input type="number" id="minLikes" value="0" min="0">
+
+  <div class="toggle-row">
+    <label class="toggle-label" for="iconMode">Icon buttons</label>
+    <label class="toggle">
+      <input type="checkbox" id="iconMode">
+      <span class="toggle-slider"></span>
+    </label>
+  </div>
+
+  <div class="toggle-row">
+    <label class="toggle-label" for="hideAfterSave">Hide after saving</label>
+    <label class="toggle">
+      <input type="checkbox" id="hideAfterSave">
+      <span class="toggle-slider"></span>
+    </label>
+  </div>
+
+  <button id="saveBtn">Save Settings</button>
+  <p id="status"></p>
+  <script src="popup.js"></script>
+</body>
+</html>
