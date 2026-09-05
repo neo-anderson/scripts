@@ -5,7 +5,7 @@
 // @match       https://flow.google.com/project/*
 // @match       https://labs.google/fx/tools/flow/project/*
 // @grant       none
-// @version     2.5
+// @version     2.6
 // ==/UserScript==
 
 // JSON sidecar instead of ⁠.txt + ⁠.md — a single ⁠image-filename.ext.json is written per image via the new ⁠buildJson(), producing exactly your target shape:
@@ -30,12 +30,11 @@
 // }
 // **Separate toggles for downloading 2K upscaled & default 1K** (both enabled by default) and a **minimize/expand** toggle for the panel.
 // default model and offset options on the panel.
-// bulk delete
 
 (function() {
     'use strict';
 
-    console.log('[Auto-Upscaler v2.5] Script loaded on:', window.location.href);
+    console.log('[Auto-Upscaler v2.6] Script loaded on:', window.location.href);
 
     // Store tokens intercepted from normal page traffic or Google BOQ WIZ data
     window.__upscale_tokens = {
@@ -202,9 +201,6 @@
     const FAILURE_WAIT_OFFSET = 7;      // constant base wait after a failure
     const FAILURE_WAIT_RAND_MIN = 1;    // random extra wait, lower bound
     const FAILURE_WAIT_RAND_MAX = 3;    // random extra wait, upper bound
-    const DELETE_WAIT_OFFSET = 2;       // constant base wait between deletes
-    const DELETE_WAIT_RAND_MIN = 1;     // random extra wait, lower bound
-    const DELETE_WAIT_RAND_MAX = 3;     // random extra wait, upper bound
 
     function getProjectId() {
         // Try to grab from the current URL first: /fx/tools/flow/project/<id> or /project/<id>
@@ -451,11 +447,9 @@
     offsetDiv.appendChild(inpSuccessOffset.parentElement);
     const inpFailureOffset = createOffsetRow('Failure offset (s)', 'inp-failure-offset', FAILURE_WAIT_OFFSET, false);
     offsetDiv.appendChild(inpFailureOffset.parentElement);
-    const inpDeleteOffset = createOffsetRow('Delete offset (s)', 'inp-delete-offset', DELETE_WAIT_OFFSET, true);
-    offsetDiv.appendChild(inpDeleteOffset.parentElement);
     panelContent.appendChild(offsetDiv);
 
-    // Action buttons
+    // Action button
     const btnUpscale = document.createElement('button');
     btnUpscale.id = 'btn-upscale-selected';
     btnUpscale.textContent = 'Upscale / Download Selected';
@@ -469,21 +463,6 @@
         borderRadius: '4px',
     });
     panelContent.appendChild(btnUpscale);
-
-    const btnDelete = document.createElement('button');
-    btnDelete.id = 'btn-delete-selected';
-    btnDelete.textContent = 'Delete Selected';
-    Object.assign(btnDelete.style, {
-        width: '100%',
-        padding: '8px',
-        marginTop: '8px',
-        cursor: 'pointer',
-        backgroundColor: '#F44336',
-        color: 'white',
-        border: 'none',
-        borderRadius: '4px',
-    });
-    panelContent.appendChild(btnDelete);
 
     controlPanel.appendChild(panelContent);
 
@@ -538,57 +517,11 @@
         const v = parseFloat(inpFailureOffset.value);
         return isNaN(v) || v < 0 ? FAILURE_WAIT_OFFSET : v;
     }
-    function getDeleteOffset() {
-        const v = parseFloat(inpDeleteOffset.value);
-        return isNaN(v) || v < 0 ? DELETE_WAIT_OFFSET : v;
-    }
 
     // Update the "Selected: N" counter in the floating panel
     function updateSelectedCount() {
         const count = document.querySelectorAll('.upscaler-checkbox:checked').length;
         statusSelected.textContent = String(count);
-    }
-
-    // Add a persistent "🗑 Deleted" badge overlay onto a tile (idempotent)
-    function markTileDeleted(cb) {
-        const container = cb.closest('flow-grid-tile-container') ||
-                          cb.closest('flow-tile-container') ||
-                          cb.closest('flow-image-tile') ||
-                          cb.closest('a') ||
-                          cb.parentElement.parentElement ||
-                          cb.parentElement;
-        if (!container) return;
-
-        // Dim the whole tile
-        container.style.opacity = '0.45';
-        container.style.filter = 'grayscale(1)';
-        container.style.transition = 'opacity 0.2s, filter 0.2s';
-
-        // Avoid adding the badge twice
-        if (container.querySelector('.upscaler-deleted-badge')) return;
-
-        if (window.getComputedStyle(container).position === 'static') {
-            container.style.position = 'relative';
-        }
-
-        const badge = document.createElement('div');
-        badge.className = 'upscaler-deleted-badge';
-        badge.innerText = '🗑 Deleted';
-        badge.style.position = 'absolute';
-        badge.style.top = '5px';
-        badge.style.left = '5px';
-        badge.style.right = '5px';
-        badge.style.padding = '4px 6px';
-        badge.style.backgroundColor = 'rgba(244, 67, 54, 0.92)';
-        badge.style.color = '#fff';
-        badge.style.fontSize = '12px';
-        badge.style.fontWeight = 'bold';
-        badge.style.fontFamily = 'monospace';
-        badge.style.textAlign = 'center';
-        badge.style.borderRadius = '4px';
-        badge.style.zIndex = '101';
-        badge.style.pointerEvents = 'none';
-        container.appendChild(badge);
     }
 
     async function getFreshRecaptchaToken() {
@@ -742,29 +675,6 @@
             tags: buildTags(meta, upscaled),
             notes: buildNotes(meta)
         }, null, 2);
-    }
-
-    // ---- DELETE (archive) a workflow via PATCH ----
-    async function archiveWorkflow(workflowId) {
-        const t = window.__upscale_tokens;
-        return window.fetch(`https://aisandbox-pa.googleapis.com/v1/flowWorkflows/${workflowId}`, {
-            headers: {
-                "accept": "*/*",
-                "authorization": t.authToken,
-                "content-type": "text/plain;charset=UTF-8",
-            },
-            body: JSON.stringify({
-                workflow: {
-                    name: workflowId,
-                    projectId: getProjectId(),
-                    metadata: { archived: true }
-                },
-                updateMask: "metadata.archived"
-            }),
-            method: "PATCH",
-            mode: "cors",
-            credentials: "include"
-        });
     }
 
     let reqCounter = 6060000;
@@ -1107,71 +1017,6 @@
         btn.disabled = false;
     };
 
-    // ---- DELETE SELECTED (archive) ----
-    btnDelete.onclick = async () => {
-        const checkedBoxes = Array.from(document.querySelectorAll('.upscaler-checkbox:checked'));
-        if (checkedBoxes.length === 0) {
-            alert("No images selected.");
-            return;
-        }
-
-        const t = window.__upscale_tokens;
-        extractTokensFromWiz();
-        if (!t.authToken && !t.at) {
-            alert("Cannot delete yet! Wait for Auth token to turn green (✅).");
-            return;
-        }
-
-        // Ensure every selected tile has a workflow ID; warn about any that don't.
-        const missing = checkedBoxes.filter(cb => !cb.dataset.workflowId).length;
-        if (!confirm(`Move ${checkedBoxes.length} image(s) to trash?` +
-            (missing ? `\n\n⚠️ ${missing} have no workflow ID and will be skipped.` : '') +
-            `\n\nThis is reversible from the app's trash.`)) {
-            return;
-        }
-
-        const btn = btnDelete;
-        btn.innerText = `Deleting 0 / ${checkedBoxes.length}...`;
-        btn.disabled = true;
-
-        for (let i = 0; i < checkedBoxes.length; i++) {
-            const cb = checkedBoxes[i];
-            const workflowId = cb.dataset.workflowId || window.__media_to_workflow[cb.value] || '';
-            btn.innerText = `Deleting ${i + 1} / ${checkedBoxes.length}...`;
-
-            let iterationSuccess = false;
-            try {
-                if (!workflowId) throw new Error("No workflow ID captured for this tile");
-                const res = await archiveWorkflow(workflowId);
-                if (res.ok) {
-                    console.log(`[Auto-Upscaler] Archived workflow ${workflowId}`);
-                    markTileDeleted(cb); // visual indication on the tile
-                    cb.checked = false;
-                    cb.disabled = true;  // prevent re-selecting a deleted tile
-                    updateSelectedCount();
-                    iterationSuccess = true;
-                } else {
-                    console.error(`[Auto-Upscaler] Delete failed for ${workflowId}:`, await res.text());
-                    cb.parentElement.style.backgroundColor = 'rgba(244, 67, 54, 0.4)';
-                }
-            } catch (e) {
-                console.error(`[Auto-Upscaler] Delete error:`, e);
-                cb.parentElement.style.backgroundColor = 'rgba(244, 67, 54, 0.4)';
-            }
-
-            // Throttle between deletes using the dedicated delete offset
-            if (i < checkedBoxes.length - 1) {
-                const sleepTime = computeWaitMs(getDeleteOffset(), DELETE_WAIT_RAND_MIN, DELETE_WAIT_RAND_MAX);
-                console.log(`[Auto-Upscaler] Delete throttle — sleeping for ${sleepTime}ms...`);
-                await sleep(sleepTime);
-            }
-        }
-
-        btn.innerText = 'Delete Selected';
-        btn.disabled = false;
-        console.log("[Auto-Upscaler] Delete batch done. Reload the page to refresh the grid.");
-    };
-
     function updateStatusUI() {
         extractTokensFromWiz();
         const hasAuth = !!(window.__upscale_tokens.at || window.__upscale_tokens.authToken);
@@ -1283,7 +1128,7 @@
             checkbox.type = 'checkbox';
             checkbox.className = 'upscaler-checkbox';
             checkbox.value = mediaId;
-            checkbox.dataset.workflowId = workflowId; // stash workflow ID for delete
+            if (workflowId) checkbox.dataset.workflowId = workflowId;
             checkbox.style.cursor = 'pointer';
             checkbox.style.width = '14px';
             checkbox.style.height = '14px';
