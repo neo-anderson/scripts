@@ -5,7 +5,7 @@
 // @match       https://flow.google.com/project/*
 // @match       https://labs.google/fx/tools/flow/project/*
 // @grant       none
-// @version     2.6
+// @version     2.7
 // ==/UserScript==
 
 // JSON sidecar instead of ⁠.txt + ⁠.md — a single ⁠image-filename.ext.json is written per image via the new ⁠buildJson(), producing exactly your target shape:
@@ -34,7 +34,7 @@
 (function() {
     'use strict';
 
-    console.log('[Auto-Upscaler v2.6] Script loaded on:', window.location.href);
+    console.log('[Auto-Upscaler v2.7] Script loaded on:', window.location.href);
 
     // Store tokens intercepted from normal page traffic or Google BOQ WIZ data
     window.__upscale_tokens = {
@@ -50,6 +50,7 @@
         recaptchaAction: ''  // Action name for grecaptcha (e.g. IMAGE_GENERATION)
     };
     window.__media_to_workflow = window.__media_to_workflow || {};
+    window.__media_to_cdn_url = window.__media_to_cdn_url || {};
 
     function hookRecaptcha() {
         try {
@@ -718,6 +719,57 @@
         });
     }
 
+    async function sendBatchExecute1KUrl(mediaId) {
+        const t = window.__upscale_tokens;
+        extractTokensFromWiz();
+
+        const bl = t.bl || 'boq_labs-ai-sandbox-frontend_20260903.13_p1';
+        const fSid = t.fSid || '';
+        const at = t.at || '';
+        const reqId = ++reqCounter;
+        const sourcePath = t.sourcePath || encodeURIComponent(window.location.pathname);
+
+        const url = `https://flow.google.com/_/AiSandboxAngularFrontend/data/batchexecute?rpcids=as29s&source-path=${sourcePath}&bl=${encodeURIComponent(bl)}&f.sid=${encodeURIComponent(fSid)}&hl=en&_reqid=${reqId}&rt=c`;
+
+        // Payload format for as29s: [mediaId]
+        const rpcInnerData = [mediaId];
+        const rpcEnvelope = [
+            [
+                ["as29s", JSON.stringify(rpcInnerData), null, "generic"]
+            ]
+        ];
+
+        const body = `f.req=${encodeURIComponent(JSON.stringify(rpcEnvelope))}&at=${encodeURIComponent(at)}&`;
+
+        const res = await window.fetch(url, {
+            headers: {
+                "accept": "*/*",
+                "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+                "x-same-domain": "1"
+            },
+            body: body,
+            method: "POST",
+            mode: "cors",
+            credentials: "include"
+        });
+
+        if (!res.ok) {
+            throw new Error(`as29s RPC returned HTTP ${res.status}`);
+        }
+
+        const text = await res.text();
+        const match = text.match(/(https:[\\/]+flow-content\.google[\\/]+image[\\/][a-zA-Z0-9-]+[^"'\s]+)/);
+        if (match && match[1]) {
+            return match[1]
+                .replace(/\\u003d/gi, '=')
+                .replace(/\\u0026/gi, '&')
+                .replace(/\\u002f/gi, '/')
+                .replace(/\\/g, '');
+        }
+
+        return null;
+    }
+
     function parseBatchExecuteResponse(responseText) {
         if (!responseText) return null;
 
@@ -876,7 +928,11 @@
             };
 
             const downloadUrl = async (url, filename) => {
-                const r = await window.fetch(url);
+                const opts = url.includes('flow-content.google') ? { credentials: 'omit' } : {};
+                const r = await window.fetch(url, opts);
+                if (!r.ok) {
+                    throw new Error(`HTTP ${r.status} fetching ${url}`);
+                }
                 const blob = await r.blob();
                 const blobUrl = window.URL.createObjectURL(blob);
                 const a = document.createElement('a');
@@ -959,23 +1015,48 @@
                         }
                         console.log(`[Auto-Upscaler] Downloading 1K default for ${mediaId}...`);
                         const imageFilename = `GoogleFlow_1K_${mediaId}.jpg`;
-                        let oneKUrl = `${window.location.origin}/fx/api/trpc/media.getMediaUrlRedirect?name=${mediaId}`;
-                        const img = document.querySelector(`img[data-media-id="${mediaId}"]`) ||
-                                    document.querySelector(`img[alt="Generated image"][src*="name=${mediaId}"]`) ||
-                                    document.querySelector(`img[src*="name=${mediaId}"]`) ||
-                                    document.querySelector(`img[src*="${mediaId}"]`);
-                        if (img && img.src) {
-                            // On flow.google.com, asb URLs have =s<size> (e.g. =s512-rw); replacing with =s0 gives original full-res
-                            oneKUrl = img.src.includes('=s') ? img.src.replace(/=s\d+[^/]*$/, '=s0') : img.src;
-                        } else {
-                            const anyImg = document.querySelector('img[src*="media.getMediaUrlRedirect"]');
-                            if (anyImg && anyImg.src) {
-                                try {
-                                    const u = new URL(anyImg.src);
-                                    oneKUrl = `${u.origin}${u.pathname}?name=${mediaId}`;
-                                } catch (e) {}
+                        let oneKUrl = (window.__media_to_cdn_url && window.__media_to_cdn_url[mediaId]) || null;
+
+                        // Try getting official signed CDN URL via as29s RPC on flow.google.com
+                        if (!oneKUrl && (window.location.hostname.includes('flow.google.com') || t.at)) {
+                            try {
+                                oneKUrl = await sendBatchExecute1KUrl(mediaId);
+                                if (oneKUrl) {
+                                    window.__media_to_cdn_url = window.__media_to_cdn_url || {};
+                                    window.__media_to_cdn_url[mediaId] = oneKUrl;
+                                    console.log(`[Auto-Upscaler] Obtained signed 1K CDN URL via as29s for ${mediaId}`);
+                                }
+                            } catch (errAs29s) {
+                                console.warn(`[Auto-Upscaler] as29s RPC failed for ${mediaId}, trying fallback:`, errAs29s);
                             }
                         }
+
+                        // Fallback: Check DOM img src or legacy URL
+                        if (!oneKUrl) {
+                            const img = document.querySelector(`img[data-media-id="${mediaId}"]`) ||
+                                        document.querySelector(`img[alt="Generated image"][src*="name=${mediaId}"]`) ||
+                                        document.querySelector(`img[src*="name=${mediaId}"]`) ||
+                                        document.querySelector(`img[src*="${mediaId}"]`);
+                            if (img && img.src) {
+                                // On flow.google.com, asb URLs have =s<size> (e.g. =s512-rw); replacing with =s0 gives original full-res
+                                oneKUrl = img.src.includes('=s') ? img.src.replace(/=s\d+[^/]*$/, '=s0') : img.src;
+                            } else {
+                                const anyImg = document.querySelector('img[src*="media.getMediaUrlRedirect"]');
+                                if (anyImg && anyImg.src) {
+                                    try {
+                                        const u = new URL(anyImg.src);
+                                        oneKUrl = `${u.origin}${u.pathname}?name=${mediaId}`;
+                                    } catch (e) {}
+                                } else {
+                                    oneKUrl = `${window.location.origin}/fx/api/trpc/media.getMediaUrlRedirect?name=${mediaId}`;
+                                }
+                            }
+                        }
+
+                        if (!oneKUrl) {
+                            throw new Error(`Could not determine 1K URL for ${mediaId}`);
+                        }
+
                         await downloadUrl(oneKUrl, imageFilename);
                         await writeSidecar(imageFilename, false); // 1K -> no ai:upscaled tag
                         console.log(`[Auto-Upscaler] 1K Success for ${mediaId}`);
@@ -1241,6 +1322,29 @@
                 const clone = response.clone();
                 clone.json().then(data => {
                     findWorkflowMappings(data);
+                }).catch(() => {});
+            }
+        } catch (e) {}
+
+        // Sniff as29s responses for flow-content.google 1K image CDN URLs
+        try {
+            if (response && response.ok && (reqUrl.includes('as29s') || (options && typeof options.body === 'string' && options.body.includes('as29s')))) {
+                const clone = response.clone();
+                clone.text().then(text => {
+                    const match = text.match(/(https:[\\/]+flow-content\.google[\\/]+image[\\/][a-zA-Z0-9-]+[^"'\s]+)/);
+                    if (match && match[1]) {
+                        const cdnUrl = match[1]
+                            .replace(/\\u003d/gi, '=')
+                            .replace(/\\u0026/gi, '&')
+                            .replace(/\\u002f/gi, '/')
+                            .replace(/\\/g, '');
+                        const idMatch = cdnUrl.match(/image\/([0-9a-fA-F-]+)/);
+                        if (idMatch) {
+                            window.__media_to_cdn_url = window.__media_to_cdn_url || {};
+                            window.__media_to_cdn_url[idMatch[1]] = cdnUrl;
+                            console.log(`[Auto-Upscaler] Intercepted 1K CDN URL for ${idMatch[1]}`);
+                        }
+                    }
                 }).catch(() => {});
             }
         } catch (e) {}
