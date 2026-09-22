@@ -5,7 +5,7 @@
 // @match       https://flow.google.com/project/*
 // @match       https://labs.google/fx/tools/flow/project/*
 // @grant       none
-// @version     2.8.2
+// @version     2.8.3
 // ==/UserScript==
 
 // JSON sidecar instead of ⁠.txt + ⁠.md — a single ⁠image-filename.ext.json is written per image via the new ⁠buildJson(), producing exactly your target shape:
@@ -34,7 +34,7 @@
 (function() {
     'use strict';
 
-    const SCRIPT_VERSION = 'v2.8.2';
+    const SCRIPT_VERSION = 'v2.8.3';
 
     console.log(`[Auto-Upscaler ${SCRIPT_VERSION}] Script loaded on:`, window.location.href);
 
@@ -775,7 +775,7 @@
             body: body,
             method: "POST",
             mode: "cors",
-            credentials: "omit"
+            credentials: "include"
         });
     }
 
