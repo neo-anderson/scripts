@@ -717,20 +717,21 @@
         const t = window.__upscale_tokens;
         extractTokensFromWiz();
 
-        const bl = t.bl || 'boq_labs-ai-sandbox-frontend_20260903.13_p1';
+        const bl = t.bl || 'boq_labs-ai-sandbox-frontend_20260922.00_p0';
         const fSid = t.fSid || '';
         const at = t.at || '';
         const reqId = ++reqCounter;
         const sourcePath = t.sourcePath || encodeURIComponent(window.location.pathname);
+        const projectId = getProjectId() || t.projectId || '';
 
         const url = `https://flow.google.com/_/AiSandboxAngularFrontend/data/batchexecute?rpcids=SPrCad&source-path=${sourcePath}&bl=${encodeURIComponent(bl)}&f.sid=${encodeURIComponent(fSid)}&hl=en&_reqid=${reqId}&rt=c`;
 
         // Inner payload format for SPrCad:
-        // [mediaId, 1, [null, 22, null, null, null, null, null, null, null, null, [freshRecaptchaToken, 1]]]
+        // [mediaId, 1, [null, 22, null, null, null, projectId, null, null, null, null, [freshRecaptchaToken, 1]]]
         const rpcInnerData = [
             mediaId,
             1,
-            [null, 22, null, null, null, null, null, null, null, null, [freshRecaptchaToken, 1]]
+            [null, 22, null, null, null, projectId, null, null, null, null, [freshRecaptchaToken, 1]]
         ];
         const rpcEnvelope = [
             [
@@ -757,7 +758,7 @@
         const t = window.__upscale_tokens;
         extractTokensFromWiz();
 
-        const bl = t.bl || 'boq_labs-ai-sandbox-frontend_20260903.13_p1';
+        const bl = t.bl || 'boq_labs-ai-sandbox-frontend_20260922.00_p0';
         const fSid = t.fSid || '';
         const at = t.at || '';
         const reqId = ++reqCounter;
