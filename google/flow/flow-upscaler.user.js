@@ -5,7 +5,7 @@
 // @match       https://flow.google.com/project/*
 // @match       https://labs.google/fx/tools/flow/project/*
 // @grant       none
-// @version     2.8.3
+// @version     2.8.4
 // ==/UserScript==
 
 // JSON sidecar instead of ⁠.txt + ⁠.md — a single ⁠image-filename.ext.json is written per image via the new ⁠buildJson(), producing exactly your target shape:
@@ -34,7 +34,7 @@
 (function() {
     'use strict';
 
-    const SCRIPT_VERSION = 'v2.8.3';
+    const SCRIPT_VERSION = 'v2.8.4';
 
     console.log(`[Auto-Upscaler ${SCRIPT_VERSION}] Script loaded on:`, window.location.href);
 
@@ -56,28 +56,52 @@
 
     function hookRecaptcha() {
         try {
-            if (window.grecaptcha && window.grecaptcha.enterprise && !window.grecaptcha.enterprise.__hooked) {
+            if (!window.grecaptcha) return;
+
+            // 1. Hook grecaptcha.execute
+            if (typeof window.grecaptcha.execute === 'function' && !window.grecaptcha.execute.__hooked) {
+                const orig = window.grecaptcha.execute;
+                window.grecaptcha.execute = async function(siteKey, actionObj) {
+                    console.log('[Auto-Upscaler] Hook intercepted grecaptcha.execute call! siteKey:', siteKey, 'action:', actionObj);
+                    if (siteKey && siteKey !== 'explicit') {
+                        window.__upscale_tokens.recaptchaSiteKey = siteKey;
+                    }
+                    if (actionObj && actionObj.action) {
+                        window.__upscale_tokens.recaptchaAction = actionObj.action;
+                    }
+                    const res = await orig.apply(this, arguments);
+                    if (res && typeof res === 'string') {
+                        console.log('[Auto-Upscaler] Hook intercepted generated token of length:', res.length);
+                        window.__upscale_tokens.recaptchaToken = res;
+                        updateStatusUI();
+                    }
+                    return res;
+                };
+                window.grecaptcha.execute.__hooked = true;
+                console.log('[Auto-Upscaler] Successfully installed hook on grecaptcha.execute');
+            }
+
+            // 2. Hook grecaptcha.enterprise.execute
+            if (window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.execute === 'function' && !window.grecaptcha.enterprise.__hooked) {
                 const orig = window.grecaptcha.enterprise.execute;
-                if (typeof orig === 'function') {
-                    window.grecaptcha.enterprise.execute = async function(siteKey, actionObj) {
-                        console.log('[Auto-Upscaler] Hook intercepted grecaptcha.enterprise.execute call! siteKey:', siteKey, 'action:', actionObj);
-                        if (siteKey && siteKey !== 'explicit') {
-                            window.__upscale_tokens.recaptchaSiteKey = siteKey;
-                        }
-                        if (actionObj && actionObj.action) {
-                            window.__upscale_tokens.recaptchaAction = actionObj.action;
-                        }
-                        const res = await orig.apply(this, arguments);
-                        if (res && typeof res === 'string') {
-                            console.log('[Auto-Upscaler] Hook intercepted generated token of length:', res.length);
-                            window.__upscale_tokens.recaptchaToken = res;
-                            updateStatusUI();
-                        }
-                        return res;
-                    };
-                    window.grecaptcha.enterprise.__hooked = true;
-                    console.log('[Auto-Upscaler] Successfully installed hook on grecaptcha.enterprise.execute');
-                }
+                window.grecaptcha.enterprise.execute = async function(siteKey, actionObj) {
+                    console.log('[Auto-Upscaler] Hook intercepted grecaptcha.enterprise.execute call! siteKey:', siteKey, 'action:', actionObj);
+                    if (siteKey && siteKey !== 'explicit') {
+                        window.__upscale_tokens.recaptchaSiteKey = siteKey;
+                    }
+                    if (actionObj && actionObj.action) {
+                        window.__upscale_tokens.recaptchaAction = actionObj.action;
+                    }
+                    const res = await orig.apply(this, arguments);
+                    if (res && typeof res === 'string') {
+                        console.log('[Auto-Upscaler] Hook intercepted generated token of length:', res.length);
+                        window.__upscale_tokens.recaptchaToken = res;
+                        updateStatusUI();
+                    }
+                    return res;
+                };
+                window.grecaptcha.enterprise.__hooked = true;
+                console.log('[Auto-Upscaler] Successfully installed hook on grecaptcha.enterprise.execute');
             }
         } catch (e) {}
     }
@@ -574,11 +598,18 @@
         try {
             hookRecaptcha();
             const siteKey = getRecaptchaSiteKey();
-            const action = window.__upscale_tokens.recaptchaAction || 'IMAGE_GENERATION';
-            console.log(`[Auto-Upscaler] Requesting reCAPTCHA token with siteKey: "${siteKey}", action: "${action}"`);
+            const action = window.__upscale_tokens.recaptchaAction || null;
+            console.log(`[Auto-Upscaler] Requesting reCAPTCHA token with siteKey: "${siteKey}", action:`, action);
 
-            if (window.grecaptcha && window.grecaptcha.enterprise && siteKey && siteKey !== 'explicit') {
-                const freshToken = await window.grecaptcha.enterprise.execute(siteKey, {action: action});
+            const execFn = (window.grecaptcha && window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.execute === 'function')
+                ? window.grecaptcha.enterprise.execute
+                : (window.grecaptcha && typeof window.grecaptcha.execute === 'function')
+                    ? window.grecaptcha.execute
+                    : null;
+
+            if (execFn && siteKey && siteKey !== 'explicit') {
+                // Do not force IMAGE_GENERATION action since Google Flow registers reCAPTCHA with action: null
+                const freshToken = action ? await execFn(siteKey, {action: action}) : await execFn(siteKey);
                 if (freshToken) {
                     console.log(`[Auto-Upscaler] Generated fresh reCAPTCHA token! (length: ${freshToken.length})`);
                     window.__upscale_tokens.recaptchaToken = freshToken;
@@ -586,10 +617,10 @@
                     return freshToken;
                 }
             } else {
-                console.warn(`[Auto-Upscaler] Cannot call grecaptcha.enterprise.execute: grecaptcha=${!!window.grecaptcha}, enterprise=${!!window.grecaptcha?.enterprise}, siteKey="${siteKey}"`);
+                console.warn(`[Auto-Upscaler] Cannot call grecaptcha execute: grecaptcha=${!!window.grecaptcha}, enterprise=${!!window.grecaptcha?.enterprise}, siteKey="${siteKey}"`);
             }
         } catch (e) {
-            console.warn("[Auto-Upscaler] Error calling grecaptcha.enterprise.execute:", e);
+            console.warn("[Auto-Upscaler] Error calling grecaptcha execute:", e);
         }
 
         if (window.__upscale_tokens.recaptchaToken) {
