@@ -5,7 +5,7 @@
 // @match       https://flow.google.com/project/*
 // @match       https://labs.google/fx/tools/flow/project/*
 // @grant       none
-// @version     2.8
+// @version     2.8.1
 // ==/UserScript==
 
 // JSON sidecar instead of ⁠.txt + ⁠.md — a single ⁠image-filename.ext.json is written per image via the new ⁠buildJson(), producing exactly your target shape:
@@ -34,7 +34,9 @@
 (function() {
     'use strict';
 
-    console.log('[Auto-Upscaler v2.8] Script loaded on:', window.location.href);
+    const SCRIPT_VERSION = 'v2.8.1';
+
+    console.log(`[Auto-Upscaler ${SCRIPT_VERSION}] Script loaded on:`, window.location.href);
 
     // Store tokens intercepted from normal page traffic or Google BOQ WIZ data
     window.__upscale_tokens = {
@@ -241,7 +243,7 @@
     });
 
     const panelTitle = document.createElement('strong');
-    panelTitle.textContent = 'Auto-Upscaler';
+    panelTitle.textContent = `Auto-Upscaler ${SCRIPT_VERSION}`;
     panelHeader.appendChild(panelTitle);
 
     const btnMinimize = document.createElement('button');
