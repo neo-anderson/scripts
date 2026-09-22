@@ -1072,8 +1072,9 @@
             const item = itemsList[i];
             const mediaId = item.mediaId;
             const cb = item.checkboxEl || document.querySelector(`.upscaler-checkbox[value="${mediaId}"]`);
-            activeBtn.innerText = `Processing ${i + 1} / ${itemsList.length}...`;
-            console.log(`[Auto-Upscaler] Processing ${mediaId} (${i + 1}/${itemsList.length})...`);
+            const countLabel = `${i + 1} out of ${itemsList.length}`;
+            activeBtn.innerText = `Processing ${countLabel}...`;
+            console.log(`[Auto-Upscaler] Processing ${mediaId} (${countLabel})...`);
 
             let success2k = false;
             let success1k = false;
@@ -1221,11 +1222,11 @@
                 statusCard.style.backgroundColor = '#3b1818';
                 statusCard.style.borderColor = '#F44336';
                 statusCard.style.color = '#ff9999';
-                statusCard.textContent = `❌ STOPPED ON FAILURE!\nFailed image: ${mediaId.slice(0, 8)} (${failed2k ? '2K failed' : '1K failed'})\nLast success: ${lastInfoText}`;
+                statusCard.textContent = `❌ STOPPED ON FAILURE!\nItem: ${countLabel}\nFailed image: ${mediaId.slice(0, 8)} (${failed2k ? '2K failed' : '1K failed'})\nLast success: ${lastInfoText}`;
 
-                console.error(`[Auto-Upscaler] Auto-stopped on failure for ${mediaId}. Last successfully downloaded:`, lastSuccessfulDownload);
+                console.error(`[Auto-Upscaler] Auto-stopped on failure for ${mediaId} (${countLabel}). Last successfully downloaded:`, lastSuccessfulDownload);
 
-                activeBtn.innerText = 'Stopped on Error';
+                activeBtn.innerText = `Stopped: ${countLabel}`;
                 activeBtn.style.backgroundColor = '#F44336';
                 activeBtn.disabled = false;
                 return;
@@ -1244,7 +1245,7 @@
             statusCard.style.backgroundColor = '#1a1a1a';
             statusCard.style.borderColor = '#333';
             statusCard.style.color = '#ccc';
-            statusCard.textContent = `Processed (${i + 1}/${itemsList.length})\nLast downloaded: ${lastSuccessStr}`;
+            statusCard.textContent = `Processed: ${countLabel}\nLast downloaded: ${lastSuccessStr}`;
 
             // Throttle between requests (unless it's the last one)
             if (i < itemsList.length - 1) {
@@ -1254,7 +1255,7 @@
             }
         }
 
-        activeBtn.innerText = 'Completed!';
+        activeBtn.innerText = `Completed (${itemsList.length} out of ${itemsList.length})`;
         activeBtn.style.backgroundColor = '#4CAF50';
         activeBtn.disabled = false;
 
@@ -1262,7 +1263,7 @@
         statusCard.style.backgroundColor = '#1b381b';
         statusCard.style.borderColor = '#4CAF50';
         statusCard.style.color = '#81C784';
-        statusCard.textContent = `✅ Completed ${itemsList.length} items!\nLast downloaded: ${finalInfoText}`;
+        statusCard.textContent = `✅ Completed ${itemsList.length} out of ${itemsList.length} items!\nLast downloaded: ${finalInfoText}`;
 
         setTimeout(() => {
             activeBtn.innerText = originalBtnText;
