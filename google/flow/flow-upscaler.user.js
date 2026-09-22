@@ -5,7 +5,7 @@
 // @match       https://flow.google.com/project/*
 // @match       https://labs.google/fx/tools/flow/project/*
 // @grant       none
-// @version     2.7
+// @version     2.8
 // ==/UserScript==
 
 // JSON sidecar instead of ⁠.txt + ⁠.md — a single ⁠image-filename.ext.json is written per image via the new ⁠buildJson(), producing exactly your target shape:
@@ -34,7 +34,7 @@
 (function() {
     'use strict';
 
-    console.log('[Auto-Upscaler v2.7] Script loaded on:', window.location.href);
+    console.log('[Auto-Upscaler v2.8] Script loaded on:', window.location.href);
 
     // Store tokens intercepted from normal page traffic or Google BOQ WIZ data
     window.__upscale_tokens = {
@@ -465,6 +465,40 @@
     });
     panelContent.appendChild(btnUpscale);
 
+    // Collection Download button
+    const btnDownloadCollection = document.createElement('button');
+    btnDownloadCollection.id = 'btn-download-collection';
+    btnDownloadCollection.textContent = 'Scan & Download Collection';
+    Object.assign(btnDownloadCollection.style, {
+        width: '100%',
+        padding: '8px',
+        marginTop: '6px',
+        cursor: 'pointer',
+        backgroundColor: '#4CAF50',
+        color: 'white',
+        border: 'none',
+        borderRadius: '4px',
+    });
+    panelContent.appendChild(btnDownloadCollection);
+
+    // Status / Last Downloaded info card
+    const statusCard = document.createElement('div');
+    statusCard.id = 'upscaler-status-card';
+    Object.assign(statusCard.style, {
+        marginTop: '8px',
+        padding: '6px 8px',
+        backgroundColor: '#1a1a1a',
+        border: '1px solid #333',
+        borderRadius: '4px',
+        fontSize: '11px',
+        color: '#aaa',
+        lineHeight: '1.4',
+        wordBreak: 'break-word',
+        whiteSpace: 'pre-wrap',
+    });
+    statusCard.textContent = 'Ready';
+    panelContent.appendChild(statusCard);
+
     controlPanel.appendChild(panelContent);
 
     // ---- Minimize / restore panel ----
@@ -821,10 +855,93 @@
         return null;
     }
 
-    btnUpscale.onclick = async () => {
-        const checkedBoxes = Array.from(document.querySelectorAll('.upscaler-checkbox:checked'));
-        if (checkedBoxes.length === 0) {
-            alert("No images selected.");
+    let lastSuccessfulDownload = null; // { mediaId, filename, time }
+
+    function findScrollableContainer() {
+        const v = document.querySelector('cdk-virtual-scroll-viewport');
+        if (v && v.scrollHeight > v.clientHeight) return v;
+
+        const vItem = document.querySelector('.virtual-item-container');
+        if (vItem) {
+            let p = vItem.parentElement;
+            while (p && p !== document.body) {
+                const style = window.getComputedStyle(p);
+                const overflow = style.overflowY || style.overflow;
+                if (['auto', 'scroll'].includes(overflow) && p.scrollHeight > p.clientHeight) {
+                    return p;
+                }
+                p = p.parentElement;
+            }
+        }
+
+        const main = document.querySelector('main') || document.querySelector('flow-collection-view');
+        if (main && main.scrollHeight > main.clientHeight) return main;
+
+        return document.scrollingElement || document.documentElement || document.body || window;
+    }
+
+    async function scanCollectionImages(progressCallback) {
+        const scroller = findScrollableContainer();
+        const isWindow = (scroller === window || scroller === document.body || scroller === document.documentElement || scroller === document.scrollingElement);
+
+        const getScrollTop = () => isWindow ? (window.pageYOffset || document.documentElement.scrollTop) : scroller.scrollTop;
+        const setScrollTop = (val) => {
+            if (isWindow) {
+                window.scrollTo({ top: val, behavior: 'smooth' });
+            } else {
+                scroller.scrollTo({ top: val, behavior: 'smooth' });
+            }
+        };
+        const getScrollHeight = () => isWindow ? document.documentElement.scrollHeight : scroller.scrollHeight;
+        const getClientHeight = () => isWindow ? window.innerHeight : scroller.clientHeight;
+
+        const collected = new Map(); // mediaId -> { mediaId, prompt, model, created }
+
+        function harvestVisibleTiles() {
+            const imgs = document.querySelectorAll('img[data-media-id]');
+            imgs.forEach(img => {
+                const mid = img.dataset.mediaId;
+                if (mid && !collected.has(mid)) {
+                    const meta = getImageMetadata(mid);
+                    collected.set(mid, { mediaId: mid, ...meta });
+                }
+            });
+        }
+
+        harvestVisibleTiles();
+
+        let lastScrollTop = -1;
+        let staleCount = 0;
+
+        while (staleCount < 4) {
+            const currentTop = getScrollTop();
+            const maxScroll = getScrollHeight() - getClientHeight();
+
+            harvestVisibleTiles();
+            if (progressCallback) progressCallback(collected.size);
+
+            if (currentTop >= maxScroll - 5 || Math.abs(currentTop - lastScrollTop) < 2) {
+                staleCount++;
+            } else {
+                staleCount = 0;
+            }
+            lastScrollTop = currentTop;
+
+            const nextTop = Math.min(currentTop + Math.max(getClientHeight() * 0.75, 400), getScrollHeight());
+            setScrollTop(nextTop);
+            await sleep(350);
+        }
+
+        harvestVisibleTiles();
+        setScrollTop(0);
+        await sleep(250);
+
+        return Array.from(collected.values());
+    }
+
+    async function processMediaList(itemsList, activeBtn) {
+        if (!itemsList || itemsList.length === 0) {
+            alert("No images to process.");
             return;
         }
 
@@ -839,137 +956,136 @@
         const t = window.__upscale_tokens;
         extractTokensFromWiz();
         const isAuthReady = !!(t.at || t.authToken);
-        // Auth token is required if 2K upscale is enabled.
         if (do2k && !isAuthReady) {
             alert("Cannot upscale yet! Wait for Auth token to turn green (✅).");
             return;
         }
 
-        const btn = btnUpscale;
-        btn.innerText = `Processing 0 / ${checkedBoxes.length}...`;
-        btn.style.backgroundColor = '#FFC107';
-        btn.disabled = true;
+        const originalBtnText = (activeBtn === btnDownloadCollection) ? 'Scan & Download Collection' : 'Upscale / Download Selected';
+        const originalBtnColor = (activeBtn === btnDownloadCollection) ? '#4CAF50' : '#2196F3';
 
-        for (let i = 0; i < checkedBoxes.length; i++) {
-            const cb = checkedBoxes[i];
-            const mediaId = cb.value;
-            btn.innerText = `Processing ${i + 1} / ${checkedBoxes.length}...`;
-            console.log(`[Auto-Upscaler] Processing ${mediaId}...`);
+        activeBtn.innerText = `Processing 0 / ${itemsList.length}...`;
+        activeBtn.style.backgroundColor = '#FFC107';
+        activeBtn.disabled = true;
 
-            // Track outcome of this iteration to pick the right wait afterwards
-            let iterationSuccess = false;
+        statusCard.style.backgroundColor = '#1a1a1a';
+        statusCard.style.borderColor = '#333';
+        statusCard.style.color = '#ccc';
+        statusCard.textContent = `Starting batch (${itemsList.length} items)...`;
 
-            // Only fetch a reCAPTCHA token if 2K upscale is requested.
-            const freshToken = do2k ? await getFreshRecaptchaToken() : '';
-            if (do2k && !freshToken) {
-                console.error(`[Auto-Upscaler] Cannot upscale ${mediaId}: no reCAPTCHA token available.`);
-                alert("Cannot upscale to 2K: No reCAPTCHA token available.\n\nPlease click 'Upscale' on one image in Google Flow's interface once so the script can capture the active token/action, then try again.");
-                cb.parentElement.style.backgroundColor = 'rgba(244, 67, 54, 0.8)';
-                break;
-            }
-
-            const makePayload = (resolution) => {
-                const p = {
-                    mediaId: mediaId,
-                    clientContext: {
-                        recaptchaContext: {
-                            token: freshToken,
-                            applicationType: "RECAPTCHA_APPLICATION_TYPE_WEB"
-                        },
-                        projectId: getProjectId(),
-                        tool: "PINHOLE",
-                        userPaygateTier: "PAYGATE_TIER_ONE",
-                        sessionId: t.sessionId
-                    }
-                };
-                if (resolution) {
-                    p.targetResolution = resolution;
-                }
-                return p;
-            };
-
-            const sendRequest = async (payload) => {
-                return await window.fetch("https://aisandbox-pa.googleapis.com/v1/flow/upsampleImage", {
-                    headers: {
-                        "accept": "*/*",
-                        "authorization": t.authToken,
-                        "content-type": "text/plain;charset=UTF-8",
+        const makePayload = (mediaId, freshToken, resolution) => {
+            const p = {
+                mediaId: mediaId,
+                clientContext: {
+                    recaptchaContext: {
+                        token: freshToken,
+                        applicationType: "RECAPTCHA_APPLICATION_TYPE_WEB"
                     },
-                    body: JSON.stringify(payload),
-                    method: "POST",
-                    mode: "cors"
-                });
-            };
-
-            const downloadBase64 = (base64Data, filename) => {
-                try {
-                    const byteCharacters = atob(base64Data);
-                    const byteNumbers = new Uint8Array(byteCharacters.length);
-                    for (let i = 0; i < byteCharacters.length; i++) {
-                        byteNumbers[i] = byteCharacters.charCodeAt(i);
-                    }
-                    const blob = new Blob([byteNumbers], { type: 'image/jpeg' });
-                    const blobUrl = window.URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = blobUrl;
-                    a.download = filename;
-                    document.body.appendChild(a);
-                    a.click();
-                    document.body.removeChild(a);
-                    setTimeout(() => window.URL.revokeObjectURL(blobUrl), 15000);
-                } catch (e) {
-                    const a = document.createElement('a');
-                    a.href = 'data:image/jpeg;base64,' + base64Data;
-                    a.download = filename;
-                    document.body.appendChild(a);
-                    a.click();
-                    document.body.removeChild(a);
+                    projectId: getProjectId(),
+                    tool: "PINHOLE",
+                    userPaygateTier: "PAYGATE_TIER_ONE",
+                    sessionId: t.sessionId
                 }
             };
+            if (resolution) {
+                p.targetResolution = resolution;
+            }
+            return p;
+        };
 
-            const downloadUrl = async (url, filename) => {
-                const opts = url.includes('flow-content.google') ? { credentials: 'omit' } : {};
-                const r = await window.fetch(url, opts);
-                if (!r.ok) {
-                    throw new Error(`HTTP ${r.status} fetching ${url}`);
-                }
-                const blob = await r.blob();
-                const blobUrl = window.URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = blobUrl;
-                a.download = filename;
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-                setTimeout(() => window.URL.revokeObjectURL(blobUrl), 10000);
-            };
+        const sendRequest = async (payload) => {
+            return await window.fetch("https://aisandbox-pa.googleapis.com/v1/flow/upsampleImage", {
+                headers: {
+                    "accept": "*/*",
+                    "authorization": t.authToken,
+                    "content-type": "text/plain;charset=UTF-8",
+                },
+                body: JSON.stringify(payload),
+                method: "POST",
+                mode: "cors"
+            });
+        };
 
-            const downloadText = (content, filename) => {
-                const blob = new Blob([content], { type: 'application/json;charset=utf-8' });
-                const blobUrl = window.URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = blobUrl;
-                a.download = filename;
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-                setTimeout(() => window.URL.revokeObjectURL(blobUrl), 10000);
-            };
-
-            // Writes image-filename.ext.json sidecar
-            const writeSidecar = async (imageFilename, upscaled) => {
-                const meta = getImageMetadata(mediaId);
-                await sleep(400); // avoid the browser's multi-download block
-                downloadText(buildJson(meta, upscaled), `${imageFilename}.json`);
-            };
-
+        const downloadBase64 = (base64Data, filename) => {
             try {
-                let success2k = false;
-                let success1k = false;
+                const byteCharacters = atob(base64Data);
+                const byteNumbers = new Uint8Array(byteCharacters.length);
+                for (let i = 0; i < byteCharacters.length; i++) {
+                    byteNumbers[i] = byteCharacters.charCodeAt(i);
+                }
+                const blob = new Blob([byteNumbers], { type: 'image/jpeg' });
+                const blobUrl = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = blobUrl;
+                a.download = filename;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                setTimeout(() => window.URL.revokeObjectURL(blobUrl), 15000);
+            } catch (e) {
+                const a = document.createElement('a');
+                a.href = 'data:image/jpeg;base64,' + base64Data;
+                a.download = filename;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+            }
+        };
 
-                // 1. Process 2K Upscale if requested
-                if (do2k) {
-                    try {
+        const downloadUrl = async (url, filename) => {
+            const opts = url.includes('flow-content.google') ? { credentials: 'omit' } : {};
+            const r = await window.fetch(url, opts);
+            if (!r.ok) {
+                throw new Error(`HTTP ${r.status} fetching ${url}`);
+            }
+            const blob = await r.blob();
+            const blobUrl = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = blobUrl;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            setTimeout(() => window.URL.revokeObjectURL(blobUrl), 10000);
+        };
+
+        const downloadText = (content, filename) => {
+            const blob = new Blob([content], { type: 'application/json;charset=utf-8' });
+            const blobUrl = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = blobUrl;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            setTimeout(() => window.URL.revokeObjectURL(blobUrl), 10000);
+        };
+
+        // Writes image-filename.ext.json sidecar using either cached metadata or DOM extraction
+        const writeSidecar = async (mediaId, imageFilename, upscaled, cachedMeta) => {
+            const meta = (cachedMeta && cachedMeta.prompt) ? cachedMeta : getImageMetadata(mediaId);
+            await sleep(400); // avoid the browser's multi-download block
+            downloadText(buildJson(meta, upscaled), `${imageFilename}.json`);
+        };
+
+        for (let i = 0; i < itemsList.length; i++) {
+            const item = itemsList[i];
+            const mediaId = item.mediaId;
+            const cb = item.checkboxEl || document.querySelector(`.upscaler-checkbox[value="${mediaId}"]`);
+            activeBtn.innerText = `Processing ${i + 1} / ${itemsList.length}...`;
+            console.log(`[Auto-Upscaler] Processing ${mediaId} (${i + 1}/${itemsList.length})...`);
+
+            let success2k = false;
+            let success1k = false;
+            let currentDownloadedFilename = '';
+
+            // 1. Process 2K Upscale if requested
+            if (do2k) {
+                try {
+                    const freshToken = await getFreshRecaptchaToken();
+                    if (!freshToken) {
+                        console.error(`[Auto-Upscaler] Cannot upscale ${mediaId}: no reCAPTCHA token available.`);
+                    } else {
                         let base64Data = null;
                         if (window.location.hostname.includes('flow.google.com') || t.at) {
                             console.log(`[Auto-Upscaler] Sending 2K upscale via SPrCad batchexecute for ${mediaId}...`);
@@ -985,7 +1101,7 @@
                                 console.error(`[Auto-Upscaler] 2K Upscale failed for ${mediaId}:`, errText);
                             }
                         } else {
-                            const res = await sendRequest(makePayload("UPSAMPLE_IMAGE_RESOLUTION_2K"));
+                            const res = await sendRequest(makePayload(mediaId, freshToken, "UPSAMPLE_IMAGE_RESOLUTION_2K"));
                             if (res && res.ok) {
                                 const data = await res.json();
                                 base64Data = data.encodedImage || null;
@@ -999,16 +1115,27 @@
                             console.log(`[Auto-Upscaler] 2K Success for ${mediaId}`);
                             const imageFilename = `GoogleFlow_2K_${mediaId}.jpg`;
                             downloadBase64(base64Data, imageFilename);
-                            await writeSidecar(imageFilename, true); // 2K success -> ai:upscaled tag
+                            await writeSidecar(mediaId, imageFilename, true, item.meta);
                             success2k = true;
+                            currentDownloadedFilename = imageFilename;
+                            lastSuccessfulDownload = {
+                                mediaId: mediaId,
+                                filename: imageFilename,
+                                time: new Date().toLocaleTimeString()
+                            };
                         }
-                    } catch (err2k) {
-                        console.error(`[Auto-Upscaler] 2K Upscale error on ${mediaId}:`, err2k);
                     }
+                } catch (err2k) {
+                    console.error(`[Auto-Upscaler] 2K Upscale error on ${mediaId}:`, err2k);
                 }
+            }
 
-                // 2. Process Default 1K if requested
-                if (do1k) {
+            // 2. Process Default 1K if requested
+            if (do1k) {
+                // If 2K was requested and failed, do not proceed to 1K
+                if (do2k && !success2k) {
+                    // 2K failed, skip 1K
+                } else {
                     try {
                         if (do2k && success2k) {
                             await sleep(400); // brief pause between 2K and 1K downloads for same image
@@ -1058,44 +1185,156 @@
                         }
 
                         await downloadUrl(oneKUrl, imageFilename);
-                        await writeSidecar(imageFilename, false); // 1K -> no ai:upscaled tag
+                        await writeSidecar(mediaId, imageFilename, false, item.meta);
                         console.log(`[Auto-Upscaler] 1K Success for ${mediaId}`);
                         success1k = true;
+                        currentDownloadedFilename = imageFilename;
+                        lastSuccessfulDownload = {
+                            mediaId: mediaId,
+                            filename: imageFilename,
+                            time: new Date().toLocaleTimeString()
+                        };
                     } catch (err1k) {
                         console.error(`[Auto-Upscaler] 1K Download error on ${mediaId}:`, err1k);
                     }
                 }
-
-                // Determine overall tile iteration success
-                iterationSuccess = (do2k && success2k) || (do1k && success1k);
-
-                if (iterationSuccess) {
-                    cb.parentElement.style.backgroundColor = 'rgba(76, 175, 80, 0.8)';
-                    cb.checked = false; // Uncheck on success
-                    updateSelectedCount();
-                } else {
-                    cb.parentElement.style.backgroundColor = 'rgba(244, 67, 54, 0.8)';
-                }
-            } catch (e) {
-                console.error(`[Auto-Upscaler] General error on ${mediaId}:`, e);
-                cb.parentElement.style.backgroundColor = 'rgba(244, 67, 54, 0.8)';
-                iterationSuccess = false;
             }
 
-            // Throttle between requests (unless it's the last one).
-            // Success and failure use their own offset (from the panel) + random wait windows.
-            if (i < checkedBoxes.length - 1) {
-                const sleepTime = iterationSuccess
-                    ? computeWaitMs(getSuccessOffset(), SUCCESS_WAIT_RAND_MIN, SUCCESS_WAIT_RAND_MAX)
-                    : computeWaitMs(getFailureOffset(), FAILURE_WAIT_RAND_MIN, FAILURE_WAIT_RAND_MAX);
-                console.log(`[Auto-Upscaler] ${iterationSuccess ? 'Success' : 'Failure'} throttle — sleeping for ${sleepTime}ms...`);
+            // Determine if this item failed
+            const failed2k = do2k && !success2k;
+            const failed1k = do1k && !success1k;
+            const isFailure = failed2k || failed1k;
+
+            const targetOverlay = (cb && cb.parentElement) || document.querySelector(`.upscaler-checkbox[value="${mediaId}"]`)?.parentElement;
+
+            if (isFailure) {
+                // Highlight failed tile in red
+                if (targetOverlay) {
+                    targetOverlay.style.backgroundColor = 'rgba(244, 67, 54, 0.8)';
+                }
+
+                // Stop immediately, do NOT wait failure offset, and display last successful info
+                const lastInfoText = lastSuccessfulDownload
+                    ? `${lastSuccessfulDownload.filename} at ${lastSuccessfulDownload.time}`
+                    : 'None';
+
+                statusCard.style.backgroundColor = '#3b1818';
+                statusCard.style.borderColor = '#F44336';
+                statusCard.style.color = '#ff9999';
+                statusCard.textContent = `❌ STOPPED ON FAILURE!\nFailed image: ${mediaId.slice(0, 8)} (${failed2k ? '2K failed' : '1K failed'})\nLast success: ${lastInfoText}`;
+
+                console.error(`[Auto-Upscaler] Auto-stopped on failure for ${mediaId}. Last successfully downloaded:`, lastSuccessfulDownload);
+
+                activeBtn.innerText = 'Stopped on Error';
+                activeBtn.style.backgroundColor = '#F44336';
+                activeBtn.disabled = false;
+                return;
+            }
+
+            // On success:
+            if (targetOverlay) {
+                targetOverlay.style.backgroundColor = 'rgba(76, 175, 80, 0.8)';
+            }
+            if (cb) {
+                cb.checked = false;
+                updateSelectedCount();
+            }
+
+            const lastSuccessStr = lastSuccessfulDownload ? `${lastSuccessfulDownload.filename} (${lastSuccessfulDownload.time})` : currentDownloadedFilename;
+            statusCard.style.backgroundColor = '#1a1a1a';
+            statusCard.style.borderColor = '#333';
+            statusCard.style.color = '#ccc';
+            statusCard.textContent = `Processed (${i + 1}/${itemsList.length})\nLast downloaded: ${lastSuccessStr}`;
+
+            // Throttle between requests (unless it's the last one)
+            if (i < itemsList.length - 1) {
+                const sleepTime = computeWaitMs(getSuccessOffset(), SUCCESS_WAIT_RAND_MIN, SUCCESS_WAIT_RAND_MAX);
+                console.log(`[Auto-Upscaler] Success throttle — sleeping for ${sleepTime}ms...`);
                 await sleep(sleepTime);
             }
         }
 
-        btn.innerText = 'Upscale / Download Selected';
-        btn.style.backgroundColor = '#2196F3';
-        btn.disabled = false;
+        activeBtn.innerText = 'Completed!';
+        activeBtn.style.backgroundColor = '#4CAF50';
+        activeBtn.disabled = false;
+
+        const finalInfoText = lastSuccessfulDownload ? `${lastSuccessfulDownload.filename} (${lastSuccessfulDownload.time})` : 'All items processed';
+        statusCard.style.backgroundColor = '#1b381b';
+        statusCard.style.borderColor = '#4CAF50';
+        statusCard.style.color = '#81C784';
+        statusCard.textContent = `✅ Completed ${itemsList.length} items!\nLast downloaded: ${finalInfoText}`;
+
+        setTimeout(() => {
+            activeBtn.innerText = originalBtnText;
+            activeBtn.style.backgroundColor = originalBtnColor;
+        }, 3500);
+    }
+
+    btnUpscale.onclick = async () => {
+        const checkedBoxes = Array.from(document.querySelectorAll('.upscaler-checkbox:checked'));
+        if (checkedBoxes.length === 0) {
+            alert("No images selected.");
+            return;
+        }
+
+        const itemsList = checkedBoxes.map(cb => ({
+            mediaId: cb.value,
+            checkboxEl: cb,
+            meta: getImageMetadata(cb.value)
+        }));
+
+        await processMediaList(itemsList, btnUpscale);
+    };
+
+    btnDownloadCollection.onclick = async () => {
+        const do2k = cbDownload2k.checked;
+        const do1k = cbDownload1k.checked;
+        if (!do2k && !do1k) {
+            alert("Please enable at least one download option (2K Upscaled or Default 1K).");
+            return;
+        }
+
+        const t = window.__upscale_tokens;
+        extractTokensFromWiz();
+        const isAuthReady = !!(t.at || t.authToken);
+        if (do2k && !isAuthReady) {
+            alert("Cannot upscale yet! Wait for Auth token to turn green (✅).");
+            return;
+        }
+
+        btnDownloadCollection.disabled = true;
+        btnDownloadCollection.style.backgroundColor = '#FFC107';
+        btnDownloadCollection.innerText = 'Scanning collection...';
+
+        statusCard.style.backgroundColor = '#1a1a1a';
+        statusCard.style.borderColor = '#333';
+        statusCard.style.color = '#ccc';
+        statusCard.textContent = 'Scanning collection viewport...';
+
+        const collectionItems = await scanCollectionImages((count) => {
+            btnDownloadCollection.innerText = `Scanning... (${count} found)`;
+            statusCard.textContent = `Scanning collection... ${count} images found`;
+        });
+
+        if (collectionItems.length === 0) {
+            alert("No images found in current view/collection.");
+            btnDownloadCollection.innerText = 'Scan & Download Collection';
+            btnDownloadCollection.style.backgroundColor = '#4CAF50';
+            btnDownloadCollection.disabled = false;
+            statusCard.textContent = 'Ready';
+            return;
+        }
+
+        console.log(`[Auto-Upscaler] Discovered ${collectionItems.length} images in collection.`);
+        statusCard.textContent = `Found ${collectionItems.length} images. Starting download...`;
+
+        const itemsList = collectionItems.map(item => ({
+            mediaId: item.mediaId,
+            checkboxEl: document.querySelector(`.upscaler-checkbox[value="${item.mediaId}"]`),
+            meta: item
+        }));
+
+        await processMediaList(itemsList, btnDownloadCollection);
     };
 
     function updateStatusUI() {
