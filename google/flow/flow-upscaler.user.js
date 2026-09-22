@@ -5,7 +5,7 @@
 // @match       https://flow.google.com/project/*
 // @match       https://labs.google/fx/tools/flow/project/*
 // @grant       none
-// @version     2.8.1
+// @version     2.8.2
 // ==/UserScript==
 
 // JSON sidecar instead of ⁠.txt + ⁠.md — a single ⁠image-filename.ext.json is written per image via the new ⁠buildJson(), producing exactly your target shape:
@@ -34,7 +34,7 @@
 (function() {
     'use strict';
 
-    const SCRIPT_VERSION = 'v2.8.1';
+    const SCRIPT_VERSION = 'v2.8.2';
 
     console.log(`[Auto-Upscaler ${SCRIPT_VERSION}] Script loaded on:`, window.location.href);
 
@@ -81,6 +81,15 @@
             }
         } catch (e) {}
     }
+
+    // Attempt hook immediately on load, and keep checking until installed
+    hookRecaptcha();
+    const recaptchaHookPoll = setInterval(() => {
+        hookRecaptcha();
+        if (window.grecaptcha && window.grecaptcha.enterprise && window.grecaptcha.enterprise.__hooked) {
+            clearInterval(recaptchaHookPoll);
+        }
+    }, 250);
 
     function getRecaptchaSiteKey() {
         if (window.__upscale_tokens.recaptchaSiteKey && window.__upscale_tokens.recaptchaSiteKey !== 'explicit') {
@@ -719,14 +728,25 @@
         const t = window.__upscale_tokens;
         extractTokensFromWiz();
 
-        const bl = t.bl || 'boq_labs-ai-sandbox-frontend_20260922.00_p0';
-        const fSid = t.fSid || '';
-        const at = t.at || '';
+        const bl = t.bl || (window.WIZ_global_data && window.WIZ_global_data.cfb2h) || 'boq_labs-ai-sandbox-frontend_20260922.00_p0';
+        const fSid = t.fSid || (window.WIZ_global_data && window.WIZ_global_data.FdrFJe) || '';
+        const at = t.at || (window.WIZ_global_data && window.WIZ_global_data.SNlM0e) || '';
         const reqId = ++reqCounter;
-        const sourcePath = t.sourcePath || encodeURIComponent(window.location.pathname);
+        const sourcePath = encodeURIComponent(window.location.pathname) || t.sourcePath;
         const projectId = getProjectId() || t.projectId || '';
 
         const url = `https://flow.google.com/_/AiSandboxAngularFrontend/data/batchexecute?rpcids=SPrCad&source-path=${sourcePath}&bl=${encodeURIComponent(bl)}&f.sid=${encodeURIComponent(fSid)}&hl=en&_reqid=${reqId}&rt=c`;
+
+        console.log(`[Auto-Upscaler] Dispatching SPrCad 2K for ${mediaId}:`, {
+            url,
+            projectId,
+            sourcePath,
+            fSid,
+            bl,
+            hasAt: !!at,
+            atPreview: at ? at.substring(0, 16) + '...' : 'MISSING',
+            tokenLen: freshRecaptchaToken ? freshRecaptchaToken.length : 0
+        });
 
         // Inner payload format for SPrCad:
         // [mediaId, 1, [null, 22, null, null, null, projectId, null, null, null, null, [freshRecaptchaToken, 1]]]
@@ -743,6 +763,9 @@
 
         const body = `f.req=${encodeURIComponent(JSON.stringify(rpcEnvelope))}&at=${encodeURIComponent(at)}&`;
 
+        // Clear used single-use recaptcha token so stale tokens are never replayed
+        window.__upscale_tokens.recaptchaToken = '';
+
         return await window.fetch(url, {
             headers: {
                 "accept": "*/*",
@@ -752,7 +775,7 @@
             body: body,
             method: "POST",
             mode: "cors",
-            credentials: "include"
+            credentials: "omit"
         });
     }
 
@@ -760,11 +783,11 @@
         const t = window.__upscale_tokens;
         extractTokensFromWiz();
 
-        const bl = t.bl || 'boq_labs-ai-sandbox-frontend_20260922.00_p0';
-        const fSid = t.fSid || '';
-        const at = t.at || '';
+        const bl = t.bl || (window.WIZ_global_data && window.WIZ_global_data.cfb2h) || 'boq_labs-ai-sandbox-frontend_20260922.00_p0';
+        const fSid = t.fSid || (window.WIZ_global_data && window.WIZ_global_data.FdrFJe) || '';
+        const at = t.at || (window.WIZ_global_data && window.WIZ_global_data.SNlM0e) || '';
         const reqId = ++reqCounter;
-        const sourcePath = t.sourcePath || encodeURIComponent(window.location.pathname);
+        const sourcePath = encodeURIComponent(window.location.pathname) || t.sourcePath;
 
         const url = `https://flow.google.com/_/AiSandboxAngularFrontend/data/batchexecute?rpcids=as29s&source-path=${sourcePath}&bl=${encodeURIComponent(bl)}&f.sid=${encodeURIComponent(fSid)}&hl=en&_reqid=${reqId}&rt=c`;
 
@@ -1486,7 +1509,45 @@
         updateSelectedCount();
     }, 1000);
 
-    // 2. Intercept fetch to steal tokens and payload
+    // 2. Intercept XMLHttpRequest to capture live tokens from Google Flow's native requests
+    const originalXhrOpen = XMLHttpRequest.prototype.open;
+    const originalXhrSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+        this.__flowReqUrl = url;
+        this.__flowReqMethod = method;
+        return originalXhrOpen.apply(this, [method, url, ...rest]);
+    };
+    XMLHttpRequest.prototype.send = function(body) {
+        try {
+            const reqUrl = this.__flowReqUrl ? String(this.__flowReqUrl) : '';
+            if (reqUrl.includes('batchexecute')) {
+                const u = new URL(reqUrl, window.location.origin);
+                const bl = u.searchParams.get('bl');
+                if (bl) window.__upscale_tokens.bl = bl;
+                const fSid = u.searchParams.get('f.sid');
+                if (fSid) window.__upscale_tokens.fSid = fSid;
+                const sp = u.searchParams.get('source-path');
+                if (sp) window.__upscale_tokens.sourcePath = encodeURIComponent(sp);
+
+                if (typeof body === 'string') {
+                    const atMatch = body.match(/at=([^&]+)/);
+                    if (atMatch) {
+                        window.__upscale_tokens.at = decodeURIComponent(atMatch[1]);
+                        updateStatusUI();
+                    }
+                    const rcMatch = body.match(/0cAF[a-zA-Z0-9_-]+/);
+                    if (rcMatch) {
+                        console.log('[Auto-Upscaler] Intercepted reCAPTCHA token from XHR body (length: ' + rcMatch[0].length + ')');
+                        window.__upscale_tokens.recaptchaToken = rcMatch[0];
+                        updateStatusUI();
+                    }
+                }
+            }
+        } catch (e) {}
+        return originalXhrSend.apply(this, arguments);
+    };
+
+    // 3. Intercept fetch to steal tokens and payload
     const originalFetch = window.fetch;
     window.fetch = async function(...args) {
         const [url, options] = args;
