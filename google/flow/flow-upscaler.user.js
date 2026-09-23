@@ -5,13 +5,15 @@
 // @match       https://flow.google.com/project/*
 // @match       https://labs.google/fx/tools/flow/project/*
 // @grant       none
-// @version     2.8.9
+// @version     2.8.10
 // ==/UserScript==
 
 // --- VERSION LOG ---
+// v2.8.10: Context Menu Submenu Trigger Pre-Inspection
+//   - Inspects mat-mdc-menu-item-submenu-trigger / aria-haspopup on "Download" item before clicking to distinguish 2K-capable items from direct download buttons.
+//   - Cleanly closes the menu without firing the native un-renamed download and proceeds to 1K fallback.
 // v2.8.9: Graceful Fallback for Models Without 2K Upscaling
-//   - Detects whether the native context menu "Download" item opens a 2K submenu or is a direct download button.
-//   - If an image lacks 2K upscaling (direct download button without 2K submenu), gracefully skips 2K without triggering false failure stops.
+//   - Handles non-2K models and workflows without triggering false failure halts.
 //   - Automatically downloads the 1K original version if 1K downloading is enabled in the floating panel.
 // v2.8.8: Scope Fix for Continuous Downloader Sidecars
 //   - Lifted downloadText, downloadUrl, downloadBase64, and writeSidecar to module scope.
@@ -64,7 +66,7 @@
 (function() {
     'use strict';
 
-    const SCRIPT_VERSION = 'v2.8.9';
+    const SCRIPT_VERSION = 'v2.8.10';
 
     console.log(`[Auto-Upscaler ${SCRIPT_VERSION}] Script loaded on:`, window.location.href);
 

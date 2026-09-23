@@ -7,6 +7,17 @@ This document records the architectural decisions, reverse-engineering findings,
 
 ## Version History
 
+### v2.8.10 (2026-09-22) — Pre-Click Submenu Trigger Inspection
+- **Context & Requirement**:
+  - In v2.8.9, unconditionally clicking the "Download" button to check for a 2K submenu triggered Google's native direct 1K download on non-2K items, closing the context menu and saving an un-renamed file.
+- **Solution**:
+  - `triggerNative2KUpscale` now inspects the `Download` button *before* clicking:
+    - Checks for `mat-mdc-menu-item-submenu-trigger`, `mat-menu-item-submenu-trigger`, `aria-haspopup="menu"`, or `.mat-mdc-menu-submenu-icon`.
+    - If it is not a submenu trigger, it does not click the button. It cleanly sends `Escape` and skips to 1K fallback.
+  - If it is a submenu trigger, it clicks to reveal the submenu and waits for `2K`.
+
+---
+
 ### v2.8.9 (2026-09-22) — Graceful Fallback for Non-2K Models
 - **Context & Requirement**:
   - In Google Flow, some images (e.g. certain models or workflows) do not support 2K upscaling.
