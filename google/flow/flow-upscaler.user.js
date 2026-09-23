@@ -1044,21 +1044,36 @@
                 }, 5000);
 
                 if (!downloadBtn) throw new Error(`"Download" menu item not found for ${mediaId}`);
+
+                // Check whether Download is a submenu trigger or a direct action button
+                const isSubmenuTrigger = downloadBtn.classList.contains('mat-mdc-menu-item-submenu-trigger') ||
+                                         downloadBtn.classList.contains('mat-menu-item-submenu-trigger') ||
+                                         downloadBtn.getAttribute('aria-haspopup') === 'menu' ||
+                                         !!downloadBtn.querySelector('.mat-mdc-menu-submenu-icon, [class*="submenu-icon"]');
+
+                if (!isSubmenuTrigger) {
+                    console.log(`[Auto-Upscaler] "Download" item on ${mediaId} is a direct button (no 2K submenu trigger) — skipping 2K`);
+                    window.__active_upscale_download = null;
+                    if (timer) clearTimeout(timer);
+                    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }));
+                    resolve({ status: 'skipped_no_2k' });
+                    return;
+                }
+
+                // It has a submenu: click or dispatch mouseenter to open submenu
                 downloadBtn.click();
 
-                // Wait up to 1.8s for 2K submenu to render
+                // Wait up to 3s for 2K submenu to render
                 const btn2k = await waitForOverlayElement(() => {
                     const spans = Array.from(document.querySelectorAll('.cdk-overlay-container *'))
                         .filter(e => e.children.length === 0 && e.textContent.trim() === '2K');
                     return spans.map(s => s.closest('button, [role="menuitem"], .mat-mdc-menu-item, div')).find(Boolean) || spans[0];
-                }, 1800);
+                }, 3000);
 
                 if (!btn2k) {
-                    // Download is a direct download button or has no 2K submenu (e.g. models without 2K support)
-                    console.log(`[Auto-Upscaler] "2K" submenu not present on ${mediaId} — skipping 2K`);
+                    console.log(`[Auto-Upscaler] "2K" submenu item not found on ${mediaId} — skipping 2K`);
                     window.__active_upscale_download = null;
                     if (timer) clearTimeout(timer);
-                    // Dismiss any open overlay menu
                     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }));
                     resolve({ status: 'skipped_no_2k' });
                     return;
