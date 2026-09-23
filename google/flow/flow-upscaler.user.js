@@ -5,10 +5,13 @@
 // @match       https://flow.google.com/project/*
 // @match       https://labs.google/fx/tools/flow/project/*
 // @grant       none
-// @version     2.8.7
+// @version     2.8.8
 // ==/UserScript==
 
 // --- VERSION LOG ---
+// v2.8.8: Scope Fix for Continuous Downloader Sidecars
+//   - Lifted downloadText, downloadUrl, downloadBase64, and writeSidecar to module scope.
+//   - Fixed ReferenceError: downloadText is not defined in runContinuousCollectionDownloader that caused 2K sidecars to fail and prematurely halt auto-scroll download.
 // v2.8.7: Continuous Auto-Scroll & Download
 //   - Replaced two-pass scan-and-rewind with continuous auto-scroll and download: downloads visible tiles immediately, then scrolls down to reveal the next batch.
 //   - Shows real-time counter: "Downloaded: X images so far".
@@ -57,7 +60,7 @@
 (function() {
     'use strict';
 
-    const SCRIPT_VERSION = 'v2.8.7';
+    const SCRIPT_VERSION = 'v2.8.8';
 
     console.log(`[Auto-Upscaler ${SCRIPT_VERSION}] Script loaded on:`, window.location.href);
 
@@ -1133,6 +1136,68 @@
         return document.scrollingElement || document.documentElement || document.body || window;
     }
 
+    const downloadBase64 = (base64Data, filename) => {
+        try {
+            const byteCharacters = atob(base64Data);
+            const byteNumbers = new Uint8Array(byteCharacters.length);
+            for (let i = 0; i < byteCharacters.length; i++) {
+                byteNumbers[i] = byteCharacters.charCodeAt(i);
+            }
+            const blob = new Blob([byteNumbers], { type: 'image/jpeg' });
+            const blobUrl = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = blobUrl;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            setTimeout(() => window.URL.revokeObjectURL(blobUrl), 15000);
+        } catch (e) {
+            const a = document.createElement('a');
+            a.href = 'data:image/jpeg;base64,' + base64Data;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        }
+    };
+
+    const downloadUrl = async (url, filename) => {
+        const opts = url.includes('flow-content.google') ? { credentials: 'omit' } : {};
+        const r = await window.fetch(url, opts);
+        if (!r.ok) {
+            throw new Error(`HTTP ${r.status} fetching ${url}`);
+        }
+        const blob = await r.blob();
+        const blobUrl = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = blobUrl;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => window.URL.revokeObjectURL(blobUrl), 10000);
+    };
+
+    const downloadText = (content, filename) => {
+        const blob = new Blob([content], { type: 'application/json;charset=utf-8' });
+        const blobUrl = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = blobUrl;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => window.URL.revokeObjectURL(blobUrl), 10000);
+    };
+
+    // Writes image-filename.ext.json sidecar using either cached metadata or DOM extraction
+    const writeSidecar = async (mediaId, imageFilename, upscaled, cachedMeta) => {
+        const meta = (cachedMeta && cachedMeta.prompt) ? cachedMeta : getImageMetadata(mediaId);
+        await sleep(400); // avoid the browser's multi-download block
+        downloadText(buildJson(meta, upscaled), `${imageFilename}.json`);
+    };
+
     async function runContinuousCollectionDownloader(activeBtn) {
         const do2k = cbDownload2k.checked;
         const do1k = cbDownload1k.checked;
@@ -1172,13 +1237,6 @@
         const setScrollTop = (val) => isWindow ? window.scrollTo({ top: val, behavior: 'smooth' }) : scroller.scrollTo({ top: val, behavior: 'smooth' });
         const getScrollHeight = () => isWindow ? document.documentElement.scrollHeight : scroller.scrollHeight;
         const getClientHeight = () => isWindow ? window.innerHeight : scroller.clientHeight;
-
-        // Writes image-filename.ext.json sidecar using either cached metadata or DOM extraction
-        const writeSidecar = async (mediaId, imageFilename, upscaled, cachedMeta) => {
-            const meta = (cachedMeta && cachedMeta.prompt) ? cachedMeta : getImageMetadata(mediaId);
-            await sleep(400); // avoid the browser's multi-download block
-            downloadText(buildJson(meta, upscaled), `${imageFilename}.json`);
-        };
 
         function getVisibleUnprocessedTiles() {
             const selector = 'img[data-media-id], flow-image-tile img, img[src*="media.getMediaUrlRedirect"], img[src*="name="]';
@@ -1431,68 +1489,6 @@
                 method: "POST",
                 mode: "cors"
             });
-        };
-
-        const downloadBase64 = (base64Data, filename) => {
-            try {
-                const byteCharacters = atob(base64Data);
-                const byteNumbers = new Uint8Array(byteCharacters.length);
-                for (let i = 0; i < byteCharacters.length; i++) {
-                    byteNumbers[i] = byteCharacters.charCodeAt(i);
-                }
-                const blob = new Blob([byteNumbers], { type: 'image/jpeg' });
-                const blobUrl = window.URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = blobUrl;
-                a.download = filename;
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-                setTimeout(() => window.URL.revokeObjectURL(blobUrl), 15000);
-            } catch (e) {
-                const a = document.createElement('a');
-                a.href = 'data:image/jpeg;base64,' + base64Data;
-                a.download = filename;
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-            }
-        };
-
-        const downloadUrl = async (url, filename) => {
-            const opts = url.includes('flow-content.google') ? { credentials: 'omit' } : {};
-            const r = await window.fetch(url, opts);
-            if (!r.ok) {
-                throw new Error(`HTTP ${r.status} fetching ${url}`);
-            }
-            const blob = await r.blob();
-            const blobUrl = window.URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = blobUrl;
-            a.download = filename;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            setTimeout(() => window.URL.revokeObjectURL(blobUrl), 10000);
-        };
-
-        const downloadText = (content, filename) => {
-            const blob = new Blob([content], { type: 'application/json;charset=utf-8' });
-            const blobUrl = window.URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = blobUrl;
-            a.download = filename;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            setTimeout(() => window.URL.revokeObjectURL(blobUrl), 10000);
-        };
-
-        // Writes image-filename.ext.json sidecar using either cached metadata or DOM extraction
-        const writeSidecar = async (mediaId, imageFilename, upscaled, cachedMeta) => {
-            const meta = (cachedMeta && cachedMeta.prompt) ? cachedMeta : getImageMetadata(mediaId);
-            await sleep(400); // avoid the browser's multi-download block
-            downloadText(buildJson(meta, upscaled), `${imageFilename}.json`);
         };
 
         for (let i = 0; i < itemsList.length; i++) {

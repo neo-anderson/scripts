@@ -7,6 +7,16 @@ This document records the architectural decisions, reverse-engineering findings,
 
 ## Version History
 
+### v2.8.8 (2026-09-22) — Scope Fix for Continuous Downloader Sidecars
+- **Problem**:
+  - Running "Auto Scroll & Download Collection" successfully upscaled and saved the 2K image with renaming (`GoogleFlow_2K_<mediaId>.jpg`), but immediately halted with `STOPPED ON FAILURE! Failed on: <mediaId> (2K failed)` without writing the `.json` sidecar or proceeding to the 1K download.
+  - Root Cause: `downloadText`, `downloadUrl`, and `downloadBase64` were defined locally inside `processMediaList(...)`. When `runContinuousCollectionDownloader` called `writeSidecar` (which invokes `downloadText`), it threw `ReferenceError: downloadText is not defined`. This uncaught error inside `try { ... } catch (err2k)` prevented `success2k = true` from being set, skipping 1K and triggering the auto-stop safety latch.
+- **Solution**:
+  - Lifted `downloadBase64`, `downloadUrl`, `downloadText`, and `writeSidecar` to module-level scope so both batch execution flows (`processMediaList` and `runContinuousCollectionDownloader`) share the identical download machinery.
+  - Eliminated redundant duplicate function declarations.
+
+---
+
 ### v2.8.7 (2026-09-22) — Continuous Auto-Scroll & Download
 - **Problem**:
   - The previous two-pass collection downloader scrolled all the way to the bottom to harvest IDs, then attempted to rewind to the top (`scrollTo(0)`).
