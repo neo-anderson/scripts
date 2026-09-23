@@ -7,6 +7,21 @@ This document records the architectural decisions, reverse-engineering findings,
 
 ## Version History
 
+### v2.8.7 (2026-09-22) — Continuous Auto-Scroll & Download
+- **Problem**:
+  - The previous two-pass collection downloader scrolled all the way to the bottom to harvest IDs, then attempted to rewind to the top (`scrollTo(0)`).
+  - Angular's virtual scroller recycled DOM nodes during the downward scan, causing `scrollTo(0)` to freeze or miss tiles because virtual nodes were mid-hydration.
+- **Solution**:
+  - Replaced two-pass scan-and-rewind with **continuous auto-scroll and download**:
+    1. Downloads all un-processed visible image tiles on screen immediately.
+    2. Once visible tiles are downloaded, smoothly scrolls down by ~75% viewport height.
+    3. Waits 800ms for Angular's virtual scroll to hydrate the next batch of image tiles into the DOM.
+    4. Repeats until reaching the bottom of the collection.
+  - Displays real-time progress: `Downloaded: X images so far | Currently processing: <mediaId>...`.
+  - Auto-stops cleanly on any failure, keeping all downloads safe and reporting the last successful file.
+
+---
+
 ### v2.8.6 (2026-09-22) — Inter-Resolution Throttling
 - **Changes**:
   - Replaced the hardcoded 400ms pause between 2K and 1K downloads on the same image with the full randomized success throttle (`offset + rand(1..3)s`).

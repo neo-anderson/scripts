@@ -5,10 +5,14 @@
 // @match       https://flow.google.com/project/*
 // @match       https://labs.google/fx/tools/flow/project/*
 // @grant       none
-// @version     2.8.6
+// @version     2.8.7
 // ==/UserScript==
 
 // --- VERSION LOG ---
+// v2.8.7: Continuous Auto-Scroll & Download
+//   - Replaced two-pass scan-and-rewind with continuous auto-scroll and download: downloads visible tiles immediately, then scrolls down to reveal the next batch.
+//   - Shows real-time counter: "Downloaded: X images so far".
+//   - Eliminates DOM recycling and virtual scroll lockups from rewinding long collections.
 // v2.8.6: Inter-Resolution Throttle
 //   - Added randomized throttle between 2K and 1K downloads on the same image (offset + rand(1..3)s) to match inter-image spacing.
 // v2.8.5: Native UI Driving for 2K Upscaling & Standardized Naming
@@ -53,7 +57,7 @@
 (function() {
     'use strict';
 
-    const SCRIPT_VERSION = 'v2.8.6';
+    const SCRIPT_VERSION = 'v2.8.7';
 
     console.log(`[Auto-Upscaler ${SCRIPT_VERSION}] Script loaded on:`, window.location.href);
 
@@ -543,7 +547,7 @@
     // Collection Download button
     const btnDownloadCollection = document.createElement('button');
     btnDownloadCollection.id = 'btn-download-collection';
-    btnDownloadCollection.textContent = 'Scan & Download Collection';
+    btnDownloadCollection.textContent = 'Auto Scroll & Download Collection';
     Object.assign(btnDownloadCollection.style, {
         width: '100%',
         padding: '8px',
@@ -1129,71 +1133,237 @@
         return document.scrollingElement || document.documentElement || document.body || window;
     }
 
-    async function scanCollectionImages(progressCallback) {
+    async function runContinuousCollectionDownloader(activeBtn) {
+        const do2k = cbDownload2k.checked;
+        const do1k = cbDownload1k.checked;
+        if (!do2k && !do1k) {
+            alert("Please enable at least one download option (2K Upscaled or Default 1K).");
+            return;
+        }
+
+        const t = window.__upscale_tokens;
+        extractTokensFromWiz();
+        const isAuthReady = !!(t.at || t.authToken);
+        if (do1k && !isAuthReady) {
+            alert("Cannot download 1K yet! Wait for Auth token to turn green (✅).");
+            return;
+        }
+
+        const originalBtnText = 'Auto Scroll & Download Collection';
+        const originalBtnColor = '#4CAF50';
+
+        activeBtn.disabled = true;
+        activeBtn.style.backgroundColor = '#FFC107';
+        activeBtn.innerText = 'Starting download...';
+
+        statusCard.style.backgroundColor = '#1a1a1a';
+        statusCard.style.borderColor = '#333';
+        statusCard.style.color = '#ccc';
+        statusCard.textContent = 'Starting continuous collection download...';
+
+        const processedMediaIds = new Set();
+        let totalDownloaded = 0;
+        let staleScrollCount = 0;
+        let lastSuccessfulDownload = null;
+
         const scroller = findScrollableContainer();
         const isWindow = (scroller === window || scroller === document.body || scroller === document.documentElement || scroller === document.scrollingElement);
-
         const getScrollTop = () => isWindow ? (window.pageYOffset || document.documentElement.scrollTop) : scroller.scrollTop;
-        const setScrollTop = (val) => {
-            if (isWindow) {
-                window.scrollTo({ top: val, behavior: 'smooth' });
-            } else {
-                scroller.scrollTo({ top: val, behavior: 'smooth' });
-            }
-        };
+        const setScrollTop = (val) => isWindow ? window.scrollTo({ top: val, behavior: 'smooth' }) : scroller.scrollTo({ top: val, behavior: 'smooth' });
         const getScrollHeight = () => isWindow ? document.documentElement.scrollHeight : scroller.scrollHeight;
         const getClientHeight = () => isWindow ? window.innerHeight : scroller.clientHeight;
 
-        const collected = new Map(); // mediaId -> { mediaId, prompt, model, created }
+        // Writes image-filename.ext.json sidecar using either cached metadata or DOM extraction
+        const writeSidecar = async (mediaId, imageFilename, upscaled, cachedMeta) => {
+            const meta = (cachedMeta && cachedMeta.prompt) ? cachedMeta : getImageMetadata(mediaId);
+            await sleep(400); // avoid the browser's multi-download block
+            downloadText(buildJson(meta, upscaled), `${imageFilename}.json`);
+        };
 
-        function harvestVisibleTiles() {
+        function getVisibleUnprocessedTiles() {
             const selector = 'img[data-media-id], flow-image-tile img, img[src*="media.getMediaUrlRedirect"], img[src*="name="]';
-            const imgs = document.querySelectorAll(selector);
-            imgs.forEach(img => {
+            const imgs = Array.from(document.querySelectorAll(selector));
+            const list = [];
+            for (const img of imgs) {
+                const alt = (img.getAttribute('alt') || '').toLowerCase();
+                if (alt.includes('ingredient')) continue;
+
                 let mid = img.dataset.mediaId || img.getAttribute('data-media-id') || '';
                 if (!mid && img.src) {
                     const match = img.src.match(/name=([0-9a-f-]+)/i) || img.src.match(/\/([0-9a-f-]{36})/i);
                     if (match) mid = match[1];
                 }
-                if (mid) {
-                    img.dataset.mediaId = mid;
-                    if (!collected.has(mid)) {
-                        const meta = getImageMetadata(mid);
-                        collected.set(mid, { mediaId: mid, ...meta });
+                if (mid && !processedMediaIds.has(mid)) {
+                    const tile = img.closest('flow-image-tile') || img.closest('flow-tile-container') || img.closest('.container') || img.parentElement;
+                    if (tile) {
+                        list.push({ mediaId: mid, tile, img });
                     }
                 }
-            });
+            }
+            return list;
         }
 
-        harvestVisibleTiles();
+        while (staleScrollCount < 4) {
+            const batch = getVisibleUnprocessedTiles();
 
-        let lastScrollTop = -1;
-        let staleCount = 0;
+            if (batch.length > 0) {
+                staleScrollCount = 0; // reset stale attempts
 
-        while (staleCount < 4) {
+                for (const item of batch) {
+                    const mediaId = item.mediaId;
+                    if (processedMediaIds.has(mediaId)) continue;
+                    processedMediaIds.add(mediaId);
+
+                    totalDownloaded++;
+                    activeBtn.innerText = `Downloaded: ${totalDownloaded - 1} | Next...`;
+                    statusCard.textContent = `Downloaded: ${totalDownloaded - 1} images so far\nCurrently processing: ${mediaId.slice(0, 8)}...`;
+                    console.log(`[Auto-Upscaler] Continuous Download #${totalDownloaded}: ${mediaId}`);
+
+                    let success2k = false;
+                    let success1k = false;
+                    let downloadedFilename = '';
+
+                    // 1. Process 2K if requested
+                    if (do2k) {
+                        try {
+                            const targetFilename = `GoogleFlow_2K_${mediaId}.jpg`;
+                            downloadedFilename = await triggerNative2KUpscale(mediaId, targetFilename, 60000);
+                            if (downloadedFilename) {
+                                console.log(`[Auto-Upscaler] 2K Success for ${mediaId}: ${downloadedFilename}`);
+                                const meta = getImageMetadata(mediaId);
+                                await writeSidecar(mediaId, downloadedFilename, true, meta);
+                                success2k = true;
+                                lastSuccessfulDownload = {
+                                    mediaId: mediaId,
+                                    filename: downloadedFilename,
+                                    time: new Date().toLocaleTimeString()
+                                };
+                            } else {
+                                console.error(`[Auto-Upscaler] 2K Upscale failed for ${mediaId}: No download recorded`);
+                            }
+                        } catch (err2k) {
+                            console.error(`[Auto-Upscaler] 2K Upscale error on ${mediaId}:`, err2k);
+                        }
+                    }
+
+                    // 2. Process 1K if requested
+                    if (do1k) {
+                        if (do2k && !success2k) {
+                            // 2K failed, skip 1K
+                        } else {
+                            try {
+                                if (do2k && success2k) {
+                                    const interSleep = computeWaitMs(getSuccessOffset(), SUCCESS_WAIT_RAND_MIN, SUCCESS_WAIT_RAND_MAX);
+                                    console.log(`[Auto-Upscaler] Inter-resolution throttle — pausing ${interSleep}ms between 2K and 1K for ${mediaId}...`);
+                                    await sleep(interSleep);
+                                }
+                                console.log(`[Auto-Upscaler] Downloading 1K default for ${mediaId}...`);
+                                const imageFilename = `GoogleFlow_1K_${mediaId}.jpg`;
+                                let oneKUrl = (window.__media_to_cdn_url && window.__media_to_cdn_url[mediaId]) || null;
+                                if (!oneKUrl && (window.location.hostname.includes('flow.google.com') || t.at)) {
+                                    try {
+                                        oneKUrl = await sendBatchExecute1KUrl(mediaId);
+                                    } catch (e) {}
+                                }
+                                if (!oneKUrl && item.img && item.img.src) {
+                                    oneKUrl = item.img.src.includes('=s') ? item.img.src.replace(/=s\d+[^/]*$/, '=s0') : item.img.src;
+                                }
+                                if (!oneKUrl) {
+                                    throw new Error(`Could not determine 1K URL for ${mediaId}`);
+                                }
+                                await downloadUrl(oneKUrl, imageFilename);
+                                const meta = getImageMetadata(mediaId);
+                                await writeSidecar(mediaId, imageFilename, false, meta);
+                                console.log(`[Auto-Upscaler] 1K Success for ${mediaId}`);
+                                success1k = true;
+                                lastSuccessfulDownload = {
+                                    mediaId: mediaId,
+                                    filename: imageFilename,
+                                    time: new Date().toLocaleTimeString()
+                                };
+                            } catch (err1k) {
+                                console.error(`[Auto-Upscaler] 1K Download error on ${mediaId}:`, err1k);
+                            }
+                        }
+                    }
+
+                    // Handle Failure: Auto-stop immediately
+                    const failed2k = do2k && !success2k;
+                    const failed1k = do1k && !success1k;
+                    if (failed2k || failed1k) {
+                        const cb = document.querySelector(`.upscaler-checkbox[value="${mediaId}"]`);
+                        const targetOverlay = (cb && cb.parentElement) || item.tile?.querySelector('.upscaler-tile-overlay');
+                        if (targetOverlay) targetOverlay.style.backgroundColor = 'rgba(244, 67, 54, 0.8)';
+
+                        const lastInfoText = lastSuccessfulDownload
+                            ? `${lastSuccessfulDownload.filename} at ${lastSuccessfulDownload.time}`
+                            : 'None';
+
+                        statusCard.style.backgroundColor = '#3b1818';
+                        statusCard.style.borderColor = '#F44336';
+                        statusCard.style.color = '#ff9999';
+                        statusCard.textContent = `❌ STOPPED ON FAILURE!\nFailed on: ${mediaId.slice(0, 8)} (${failed2k ? '2K failed' : '1K failed'})\nDownloaded so far: ${totalDownloaded - 1}\nLast success: ${lastInfoText}`;
+
+                        activeBtn.innerText = `Stopped (${totalDownloaded - 1} downloaded)`;
+                        activeBtn.style.backgroundColor = '#F44336';
+                        activeBtn.disabled = false;
+                        return;
+                    }
+
+                    // Success visual
+                    const cb = document.querySelector(`.upscaler-checkbox[value="${mediaId}"]`);
+                    const targetOverlay = (cb && cb.parentElement) || item.tile?.querySelector('.upscaler-tile-overlay');
+                    if (targetOverlay) targetOverlay.style.backgroundColor = 'rgba(76, 175, 80, 0.8)';
+                    if (cb) {
+                        cb.checked = false;
+                        updateSelectedCount();
+                    }
+
+                    activeBtn.innerText = `Downloaded: ${totalDownloaded}`;
+                    statusCard.style.backgroundColor = '#1a1a1a';
+                    statusCard.style.borderColor = '#333';
+                    statusCard.style.color = '#ccc';
+                    statusCard.textContent = `Downloaded: ${totalDownloaded} images so far\nLast: ${lastSuccessfulDownload ? lastSuccessfulDownload.filename : mediaId.slice(0, 8)}`;
+
+                    // Throttle between images
+                    const sleepTime = computeWaitMs(getSuccessOffset(), SUCCESS_WAIT_RAND_MIN, SUCCESS_WAIT_RAND_MAX);
+                    console.log(`[Auto-Upscaler] Success throttle — sleeping for ${sleepTime}ms...`);
+                    await sleep(sleepTime);
+                }
+            }
+
+            // All visible tiles processed! Scroll down to reveal the next batch.
             const currentTop = getScrollTop();
             const maxScroll = getScrollHeight() - getClientHeight();
 
-            harvestVisibleTiles();
-            if (progressCallback) progressCallback(collected.size);
-
-            if (currentTop >= maxScroll - 5 || Math.abs(currentTop - lastScrollTop) < 2) {
-                staleCount++;
+            if (currentTop >= maxScroll - 5) {
+                staleScrollCount++;
+                console.log(`[Auto-Upscaler] Reached bottom of collection. Stale check ${staleScrollCount}/4...`);
             } else {
-                staleCount = 0;
+                staleScrollCount = 0;
             }
-            lastScrollTop = currentTop;
 
-            const nextTop = Math.min(currentTop + Math.max(getClientHeight() * 0.75, 400), getScrollHeight());
+            const scrollAmount = Math.max(getClientHeight() * 0.75, 500);
+            const nextTop = Math.min(currentTop + scrollAmount, maxScroll);
+            console.log(`[Auto-Upscaler] Scrolling viewport from ${currentTop} to ${nextTop} (max: ${maxScroll})...`);
             setScrollTop(nextTop);
-            await sleep(350);
+            await sleep(800); // Give Angular virtual scroll time to render the next batch
         }
 
-        harvestVisibleTiles();
-        setScrollTop(0);
-        await sleep(250);
+        // Finished entire collection!
+        activeBtn.innerText = `Done! (${totalDownloaded} downloaded)`;
+        activeBtn.style.backgroundColor = '#4CAF50';
+        activeBtn.disabled = false;
 
-        return Array.from(collected.values());
+        statusCard.style.backgroundColor = '#1b381b';
+        statusCard.style.borderColor = '#4CAF50';
+        statusCard.style.color = '#81C784';
+        statusCard.textContent = `✅ Collection complete!\nTotal downloaded: ${totalDownloaded} images.`;
+
+        setTimeout(() => {
+            activeBtn.innerText = originalBtnText;
+            activeBtn.style.backgroundColor = originalBtnColor;
+        }, 4000);
     }
 
     async function processMediaList(itemsList, activeBtn) {
@@ -1520,54 +1690,7 @@
     };
 
     btnDownloadCollection.onclick = async () => {
-        const do2k = cbDownload2k.checked;
-        const do1k = cbDownload1k.checked;
-        if (!do2k && !do1k) {
-            alert("Please enable at least one download option (2K Upscaled or Default 1K).");
-            return;
-        }
-
-        const t = window.__upscale_tokens;
-        extractTokensFromWiz();
-        const isAuthReady = !!(t.at || t.authToken);
-        if (do1k && !isAuthReady) {
-            alert("Cannot download 1K yet! Wait for Auth token to turn green (✅).");
-            return;
-        }
-
-        btnDownloadCollection.disabled = true;
-        btnDownloadCollection.style.backgroundColor = '#FFC107';
-        btnDownloadCollection.innerText = 'Scanning collection...';
-
-        statusCard.style.backgroundColor = '#1a1a1a';
-        statusCard.style.borderColor = '#333';
-        statusCard.style.color = '#ccc';
-        statusCard.textContent = 'Scanning collection viewport...';
-
-        const collectionItems = await scanCollectionImages((count) => {
-            btnDownloadCollection.innerText = `Scanning... (${count} found)`;
-            statusCard.textContent = `Scanning collection... ${count} images found`;
-        });
-
-        if (collectionItems.length === 0) {
-            alert("No images found in current view/collection.");
-            btnDownloadCollection.innerText = 'Scan & Download Collection';
-            btnDownloadCollection.style.backgroundColor = '#4CAF50';
-            btnDownloadCollection.disabled = false;
-            statusCard.textContent = 'Ready';
-            return;
-        }
-
-        console.log(`[Auto-Upscaler] Discovered ${collectionItems.length} images in collection.`);
-        statusCard.textContent = `Found ${collectionItems.length} images. Starting download...`;
-
-        const itemsList = collectionItems.map(item => ({
-            mediaId: item.mediaId,
-            checkboxEl: document.querySelector(`.upscaler-checkbox[value="${item.mediaId}"]`),
-            meta: item
-        }));
-
-        await processMediaList(itemsList, btnDownloadCollection);
+        await runContinuousCollectionDownloader(btnDownloadCollection);
     };
 
     function updateStatusUI() {
