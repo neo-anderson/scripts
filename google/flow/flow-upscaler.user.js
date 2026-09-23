@@ -8,6 +8,23 @@
 // @version     2.8.5
 // ==/UserScript==
 
+// --- VERSION LOG ---
+// v2.8.5: Native UI Driving for 2K Upscaling & Standardized Naming
+//   - Fixed PUBLIC_ERROR_UNUSUAL_ACTIVITY by driving Google Flow's native contextmenu -> "Download" -> "2K" flow.
+//   - Native Angular UI calls pass reCAPTCHA Enterprise with human trust scores (isTrusted: true).
+//   - Intercepted HTMLAnchorElement.prototype.click to rename native downloads to GoogleFlow_2K_<mediaId>.jpg.
+//   - Synchronized JSON sidecars matching GoogleFlow_2K_<mediaId>.jpg.json.
+//   - Added virtual scroll support to find and scroll tiles into view.
+// v2.8.4: reCAPTCHA Analysis
+//   - Removed hardcoded action: 'IMAGE_GENERATION' to match Google Flow's action: null config.
+// v2.8.3: Credentials Mode
+//   - Restored credentials: 'include' for batchexecute RPCs.
+// v2.8.2: Intercepted XMLHttpRequest for live anti-XSRF ('at') and session tokens.
+// v2.8.1: Injected projectId into SPrCad context array; displayed version on floating panel header.
+// v2.8.0: Added collection scanner, 'n out of n_max' counter, auto-stop on failure, last-success info.
+// v2.7.0: Supported official 1K original downloads via as29s RPC.
+// (See CHANGELOG.md for full architectural details and findings)
+
 // JSON sidecar instead of ⁠.txt + ⁠.md — a single ⁠image-filename.ext.json is written per image via the new ⁠buildJson(), producing exactly your target shape:
 // Multi-line prompts — ⁠JSON.stringify automatically escapes newlines as ⁠\n. To make sure the newlines survive, the new ⁠extractText() helper converts ⁠<br> elements to ⁠\n and reads via ⁠textContent (so CSS line-clamp doesn't truncate long prompts), then trims and normalizes non-breaking spaces.
 // getImageMetadata() now only returns ⁠prompt, ⁠model (used solely to derive the ⁠ai:model:* tag), and ⁠created
