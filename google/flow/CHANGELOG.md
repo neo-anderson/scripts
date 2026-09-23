@@ -7,6 +7,22 @@ This document records the architectural decisions, reverse-engineering findings,
 
 ## Version History
 
+### v2.8.11 (2026-09-23) — Robust Collection End-Detection & Row-by-Row Continuous Downloader
+- **Problems**:
+  1. *Hanging at the end*: The continuous auto-scroll downloader was unable to detect when the last image had been downloaded. It hung indefinitely at the bottom of the collection because the termination condition required `currentTop >= maxScroll - 5`, which is never satisfied in Angular CDK virtual scroll containers with bottom padding/buffer.
+  2. *Skipped rows & unexpected downloads on scroll-up*: After downloading a batch, the runner jumped down by 75% of the viewport (~800px), often leaping over rows that Angular's virtual scroller had not yet hydrated. Because the runner was hung in an infinite loop at the bottom, when the user scrolled back up, those skipped rows entered the DOM and were suddenly downloaded.
+  3. *Missing top rows*: If the user started the auto-downloader while scrolled halfway down the page, anything above the initial viewport was never visited.
+- **Solutions**:
+  - **Automatic Rewind to Top**: On startup, checks `getScrollTop() > 60` and automatically rewinds to 0 so no images above the initial viewport are missed.
+  - **Geometrical Sorting**: Harvests unprocessed tiles from both injected `.upscaler-checkbox` elements and `img` elements, sorting them visually from top to bottom (and left to right) so processing strictly follows reading order.
+  - **Process-All-Before-Advancing**: Strictly processes all currently rendered tiles in the DOM one-by-one. It never scrolls the viewport while unprocessed tiles are visible.
+  - **Safe Row-by-Row Stepping**: Only advances by ~320px (approx 1 row, never an entire viewport) to guarantee complete overlap and prevent virtual scroll skips.
+  - **Reliable End Detection**: Detects when the scroll position physically cannot advance (`didNotMove || reachedMax`) and cleanly stops after 4 verification checks with 0 new tiles, displaying `✅ Collection complete!`.
+  - **Stop Button**: Added live click-to-stop functionality to safely abort the continuous downloader at any time.
+  - **Instant Nearest Scrolling**: Switched `findAndScrollToTile` from `block: 'center', behavior: 'smooth'` to `block: 'nearest', behavior: 'auto'` to prevent unnecessary viewport bouncing during native right-clicks.
+
+---
+
 ### v2.8.10 (2026-09-22) — Pre-Click Submenu Trigger Inspection
 - **Context & Requirement**:
   - In v2.8.9, unconditionally clicking the "Download" button to check for a 2K submenu triggered Google's native direct 1K download on non-2K items, closing the context menu and saving an un-renamed file.

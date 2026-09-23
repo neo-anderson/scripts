@@ -5,10 +5,17 @@
 // @match       https://flow.google.com/project/*
 // @match       https://labs.google/fx/tools/flow/project/*
 // @grant       none
-// @version     2.8.10
+// @version     2.8.11
 // ==/UserScript==
 
 // --- VERSION LOG ---
+// v2.8.11: Robust End-of-Collection Termination & Row-by-Row Order
+//   - Rewinds to top on start so earlier images are not missed if the user is scrolled down.
+//   - Sorts visible tiles top-to-bottom so downloads strictly proceed in natural reading order without leaping past rows.
+//   - Advances viewport row-by-row (~320px) only when all currently rendered tiles have been processed.
+//   - Detects bottom boundary reliably and cleanly terminates after 4 checks with 0 new tiles, eliminating infinite hangs.
+//   - Added live Stop button to cancel continuous collection download at any time.
+//   - Uses instant nearest scrolling to prevent viewport bounce and DOM recycling during native clicks.
 // v2.8.10: Context Menu Submenu Trigger Pre-Inspection
 //   - Inspects mat-mdc-menu-item-submenu-trigger / aria-haspopup on "Download" item before clicking to distinguish 2K-capable items from direct download buttons.
 //   - Cleanly closes the menu without firing the native un-renamed download and proceeds to 1K fallback.
@@ -66,7 +73,7 @@
 (function() {
     'use strict';
 
-    const SCRIPT_VERSION = 'v2.8.10';
+    const SCRIPT_VERSION = 'v2.8.11';
 
     console.log(`[Auto-Upscaler ${SCRIPT_VERSION}] Script loaded on:`, window.location.href);
 
@@ -946,8 +953,8 @@
     async function findAndScrollToTile(mediaId) {
         let tile = findTileForMediaId(mediaId);
         if (tile) {
-            tile.scrollIntoView({ block: 'center', behavior: 'smooth' });
-            await sleep(400);
+            tile.scrollIntoView({ block: 'nearest', behavior: 'auto' });
+            await sleep(150);
             return tile;
         }
 
@@ -955,38 +962,38 @@
         const scroller = findScrollableContainer();
         const isWindow = (scroller === window || scroller === document.body || scroller === document.documentElement || scroller === document.scrollingElement);
         const getScrollTop = () => isWindow ? (window.pageYOffset || document.documentElement.scrollTop) : scroller.scrollTop;
-        const setScrollTop = (val) => isWindow ? window.scrollTo({ top: val, behavior: 'smooth' }) : scroller.scrollTo({ top: val, behavior: 'smooth' });
+        const setScrollTop = (val, behavior = 'auto') => isWindow ? window.scrollTo({ top: val, behavior }) : scroller.scrollTo({ top: val, behavior });
         const getScrollHeight = () => isWindow ? document.documentElement.scrollHeight : scroller.scrollHeight;
         const getClientHeight = () => isWindow ? window.innerHeight : scroller.clientHeight;
 
-        const maxScroll = getScrollHeight() - getClientHeight();
+        const maxScroll = Math.max(0, getScrollHeight() - getClientHeight());
         let currentTop = getScrollTop();
 
         // 1. Search downwards from current position
         while (currentTop < maxScroll) {
-            currentTop = Math.min(currentTop + 450, maxScroll);
-            setScrollTop(currentTop);
-            await sleep(350);
+            currentTop = Math.min(currentTop + 350, maxScroll);
+            setScrollTop(currentTop, 'auto');
+            await sleep(250);
             tile = findTileForMediaId(mediaId);
             if (tile) {
-                tile.scrollIntoView({ block: 'center', behavior: 'smooth' });
-                await sleep(400);
+                tile.scrollIntoView({ block: 'nearest', behavior: 'auto' });
+                await sleep(200);
                 return tile;
             }
         }
 
         // 2. If not found downwards, rewind to top and search downwards
-        setScrollTop(0);
-        await sleep(350);
+        setScrollTop(0, 'auto');
+        await sleep(300);
         currentTop = 0;
         while (currentTop < maxScroll) {
-            currentTop = Math.min(currentTop + 450, maxScroll);
-            setScrollTop(currentTop);
-            await sleep(350);
+            currentTop = Math.min(currentTop + 350, maxScroll);
+            setScrollTop(currentTop, 'auto');
+            await sleep(250);
             tile = findTileForMediaId(mediaId);
             if (tile) {
-                tile.scrollIntoView({ block: 'center', behavior: 'smooth' });
-                await sleep(400);
+                tile.scrollIntoView({ block: 'nearest', behavior: 'auto' });
+                await sleep(200);
                 return tile;
             }
         }
@@ -1248,9 +1255,12 @@
         const originalBtnText = 'Auto Scroll & Download Collection';
         const originalBtnColor = '#4CAF50';
 
-        activeBtn.disabled = true;
-        activeBtn.style.backgroundColor = '#FFC107';
-        activeBtn.innerText = 'Starting download...';
+        window.__is_auto_downloader_running = true;
+        window.__stop_auto_downloader = false;
+
+        activeBtn.disabled = false;
+        activeBtn.style.backgroundColor = '#E53935';
+        activeBtn.innerText = 'Stop Auto-Downloader (0)';
 
         statusCard.style.backgroundColor = '#1a1a1a';
         statusCard.style.borderColor = '#333';
@@ -1259,20 +1269,45 @@
 
         const processedMediaIds = new Set();
         let totalDownloaded = 0;
-        let staleScrollCount = 0;
+        let staleChecksAtBottom = 0;
         let lastSuccessfulDownload = null;
 
         const scroller = findScrollableContainer();
         const isWindow = (scroller === window || scroller === document.body || scroller === document.documentElement || scroller === document.scrollingElement);
         const getScrollTop = () => isWindow ? (window.pageYOffset || document.documentElement.scrollTop) : scroller.scrollTop;
-        const setScrollTop = (val) => isWindow ? window.scrollTo({ top: val, behavior: 'smooth' }) : scroller.scrollTo({ top: val, behavior: 'smooth' });
+        const setScrollTop = (val, behavior = 'auto') => isWindow ? window.scrollTo({ top: val, behavior }) : scroller.scrollTo({ top: val, behavior });
         const getScrollHeight = () => isWindow ? document.documentElement.scrollHeight : scroller.scrollHeight;
         const getClientHeight = () => isWindow ? window.innerHeight : scroller.clientHeight;
 
+        // Rewind to top if currently scrolled down so earlier images aren't skipped
+        const initialTop = getScrollTop();
+        if (initialTop > 60) {
+            statusCard.textContent = 'Rewinding to top of collection...';
+            console.log(`[Auto-Upscaler] Rewinding to top (from ${initialTop})...`);
+            setScrollTop(0, 'auto');
+            await sleep(700);
+        }
+
         function getVisibleUnprocessedTiles() {
-            const selector = 'img[data-media-id], flow-image-tile img, img[src*="media.getMediaUrlRedirect"], img[src*="name="]';
-            const imgs = Array.from(document.querySelectorAll(selector));
             const list = [];
+            const seenInPass = new Set();
+
+            // 1. Query injected checkboxes (most reliable mediaIds in DOM)
+            const checkboxes = document.querySelectorAll('.upscaler-checkbox');
+            for (const cb of checkboxes) {
+                const mid = cb.value;
+                if (mid && !processedMediaIds.has(mid) && !seenInPass.has(mid)) {
+                    const tile = cb.closest('flow-image-tile') || cb.closest('flow-tile-container') || cb.closest('.container') || cb.parentElement?.parentElement;
+                    if (tile) {
+                        seenInPass.add(mid);
+                        list.push({ mediaId: mid, tile, img: tile.querySelector('img') });
+                    }
+                }
+            }
+
+            // 2. Query candidate image elements
+            const selector = 'img[data-media-id], flow-image-tile img, img[src*="media.getMediaUrlRedirect"], img[src*="name="], img[alt*="Tile displaying"]';
+            const imgs = document.querySelectorAll(selector);
             for (const img of imgs) {
                 const alt = (img.getAttribute('alt') || '').toLowerCase();
                 if (alt.includes('ingredient')) continue;
@@ -1282,183 +1317,220 @@
                     const match = img.src.match(/name=([0-9a-f-]+)/i) || img.src.match(/\/([0-9a-f-]{36})/i);
                     if (match) mid = match[1];
                 }
-                if (mid && !processedMediaIds.has(mid)) {
+                if (mid && !processedMediaIds.has(mid) && !seenInPass.has(mid)) {
                     const tile = img.closest('flow-image-tile') || img.closest('flow-tile-container') || img.closest('.container') || img.parentElement;
                     if (tile) {
+                        seenInPass.add(mid);
                         list.push({ mediaId: mid, tile, img });
                     }
                 }
             }
+
+            // Sort visually: top-to-bottom, then left-to-right
+            list.sort((a, b) => {
+                const rectA = a.tile.getBoundingClientRect();
+                const rectB = b.tile.getBoundingClientRect();
+                if (Math.abs(rectA.top - rectB.top) > 25) {
+                    return rectA.top - rectB.top;
+                }
+                return rectA.left - rectB.left;
+            });
+
             return list;
         }
 
-        while (staleScrollCount < 4) {
-            const batch = getVisibleUnprocessedTiles();
+        let lastScrollTop = -1;
 
-            if (batch.length > 0) {
-                staleScrollCount = 0; // reset stale attempts
+        while (staleChecksAtBottom < 4) {
+            if (window.__stop_auto_downloader) {
+                console.log('[Auto-Upscaler] Continuous download stopped by user.');
+                statusCard.textContent = `⏹ Stopped by user.\nTotal downloaded: ${totalDownloaded} images.`;
+                break;
+            }
 
-                for (const item of batch) {
-                    const mediaId = item.mediaId;
-                    if (processedMediaIds.has(mediaId)) continue;
-                    processedMediaIds.add(mediaId);
+            const unprocessed = getVisibleUnprocessedTiles();
 
-                    totalDownloaded++;
-                    activeBtn.innerText = `Downloaded: ${totalDownloaded - 1} | Next...`;
-                    statusCard.textContent = `Downloaded: ${totalDownloaded - 1} images so far\nCurrently processing: ${mediaId.slice(0, 8)}...`;
-                    console.log(`[Auto-Upscaler] Continuous Download #${totalDownloaded}: ${mediaId}`);
+            if (unprocessed.length > 0) {
+                staleChecksAtBottom = 0; // reset bottom termination count
+                const item = unprocessed[0]; // strictly process topmost unprocessed tile!
+                const mediaId = item.mediaId;
 
-                    let success2k = false;
-                    let skipped2k = false;
-                    let success1k = false;
-                    let downloadedFilename = '';
+                processedMediaIds.add(mediaId);
+                totalDownloaded++;
 
-                    // 1. Process 2K if requested
-                    if (do2k) {
-                        try {
-                            const targetFilename = `GoogleFlow_2K_${mediaId}.jpg`;
-                            const res2k = await triggerNative2KUpscale(mediaId, targetFilename, 60000);
-                            if (res2k && res2k.status === 'skipped_no_2k') {
-                                console.log(`[Auto-Upscaler] Image ${mediaId} does not support 2K upscaling (direct Download button).`);
-                                skipped2k = true;
-                            } else if (res2k && typeof res2k === 'string') {
-                                downloadedFilename = res2k;
-                                console.log(`[Auto-Upscaler] 2K Success for ${mediaId}: ${downloadedFilename}`);
-                                const meta = getImageMetadata(mediaId);
-                                await writeSidecar(mediaId, downloadedFilename, true, meta);
-                                success2k = true;
-                                lastSuccessfulDownload = {
-                                    mediaId: mediaId,
-                                    filename: downloadedFilename,
-                                    time: new Date().toLocaleTimeString()
-                                };
-                            } else {
-                                console.error(`[Auto-Upscaler] 2K Upscale failed for ${mediaId}: No download recorded`);
-                            }
-                        } catch (err2k) {
-                            console.error(`[Auto-Upscaler] 2K Upscale error on ${mediaId}:`, err2k);
-                        }
-                    }
+                activeBtn.innerText = `Stop (${totalDownloaded} downloaded)`;
+                statusCard.textContent = `Downloaded: ${totalDownloaded - 1} images so far\nCurrently processing: ${mediaId.slice(0, 8)}...`;
+                console.log(`[Auto-Upscaler] Continuous Download #${totalDownloaded}: ${mediaId}`);
 
-                    // 2. Process 1K if requested
-                    if (do1k) {
-                        if (do2k && !success2k && !skipped2k) {
-                            // 2K failed on an actual error (not a model without 2K support), skip 1K
+                let success2k = false;
+                let skipped2k = false;
+                let success1k = false;
+                let downloadedFilename = '';
+
+                // 1. Process 2K if requested
+                if (do2k) {
+                    try {
+                        const targetFilename = `GoogleFlow_2K_${mediaId}.jpg`;
+                        const res2k = await triggerNative2KUpscale(mediaId, targetFilename, 60000);
+                        if (res2k && res2k.status === 'skipped_no_2k') {
+                            console.log(`[Auto-Upscaler] Image ${mediaId} does not support 2K upscaling (direct Download button).`);
+                            skipped2k = true;
+                        } else if (res2k && typeof res2k === 'string') {
+                            downloadedFilename = res2k;
+                            console.log(`[Auto-Upscaler] 2K Success for ${mediaId}: ${downloadedFilename}`);
+                            const meta = getImageMetadata(mediaId);
+                            await writeSidecar(mediaId, downloadedFilename, true, meta);
+                            success2k = true;
+                            lastSuccessfulDownload = {
+                                mediaId: mediaId,
+                                filename: downloadedFilename,
+                                time: new Date().toLocaleTimeString()
+                            };
                         } else {
-                            try {
-                                if (do2k && success2k) {
-                                    const interSleep = computeWaitMs(getSuccessOffset(), SUCCESS_WAIT_RAND_MIN, SUCCESS_WAIT_RAND_MAX);
-                                    console.log(`[Auto-Upscaler] Inter-resolution throttle — pausing ${interSleep}ms between 2K and 1K for ${mediaId}...`);
-                                    await sleep(interSleep);
-                                }
-                                console.log(`[Auto-Upscaler] Downloading 1K default for ${mediaId}...`);
-                                const imageFilename = `GoogleFlow_1K_${mediaId}.jpg`;
-                                let oneKUrl = (window.__media_to_cdn_url && window.__media_to_cdn_url[mediaId]) || null;
-                                if (!oneKUrl && (window.location.hostname.includes('flow.google.com') || t.at)) {
-                                    try {
-                                        oneKUrl = await sendBatchExecute1KUrl(mediaId);
-                                    } catch (e) {}
-                                }
-                                if (!oneKUrl && item.img && item.img.src) {
-                                    oneKUrl = item.img.src.includes('=s') ? item.img.src.replace(/=s\d+[^/]*$/, '=s0') : item.img.src;
-                                }
-                                if (!oneKUrl) {
-                                    throw new Error(`Could not determine 1K URL for ${mediaId}`);
-                                }
-                                await downloadUrl(oneKUrl, imageFilename);
-                                const meta = getImageMetadata(mediaId);
-                                await writeSidecar(mediaId, imageFilename, false, meta);
-                                console.log(`[Auto-Upscaler] 1K Success for ${mediaId}`);
-                                success1k = true;
-                                lastSuccessfulDownload = {
-                                    mediaId: mediaId,
-                                    filename: imageFilename,
-                                    time: new Date().toLocaleTimeString()
-                                };
-                            } catch (err1k) {
-                                console.error(`[Auto-Upscaler] 1K Download error on ${mediaId}:`, err1k);
+                            console.error(`[Auto-Upscaler] 2K Upscale failed for ${mediaId}: No download recorded`);
+                        }
+                    } catch (err2k) {
+                        console.error(`[Auto-Upscaler] 2K Upscale error on ${mediaId}:`, err2k);
+                    }
+                }
+
+                // 2. Process 1K if requested
+                if (do1k) {
+                    if (do2k && !success2k && !skipped2k) {
+                        // 2K failed on an actual error (not a model without 2K support), skip 1K
+                    } else {
+                        try {
+                            if (do2k && success2k) {
+                                const interSleep = computeWaitMs(getSuccessOffset(), SUCCESS_WAIT_RAND_MIN, SUCCESS_WAIT_RAND_MAX);
+                                console.log(`[Auto-Upscaler] Inter-resolution throttle — pausing ${interSleep}ms between 2K and 1K for ${mediaId}...`);
+                                await sleep(interSleep);
                             }
+                            console.log(`[Auto-Upscaler] Downloading 1K default for ${mediaId}...`);
+                            const imageFilename = `GoogleFlow_1K_${mediaId}.jpg`;
+                            let oneKUrl = (window.__media_to_cdn_url && window.__media_to_cdn_url[mediaId]) || null;
+                            if (!oneKUrl && (window.location.hostname.includes('flow.google.com') || t.at)) {
+                                try {
+                                    oneKUrl = await sendBatchExecute1KUrl(mediaId);
+                                } catch (e) {}
+                            }
+                            if (!oneKUrl && item.img && item.img.src) {
+                                oneKUrl = item.img.src.includes('=s') ? item.img.src.replace(/=s\d+[^/]*$/, '=s0') : item.img.src;
+                            }
+                            if (!oneKUrl) {
+                                throw new Error(`Could not determine 1K URL for ${mediaId}`);
+                            }
+                            await downloadUrl(oneKUrl, imageFilename);
+                            const meta = getImageMetadata(mediaId);
+                            await writeSidecar(mediaId, imageFilename, false, meta);
+                            console.log(`[Auto-Upscaler] 1K Success for ${mediaId}`);
+                            success1k = true;
+                            lastSuccessfulDownload = {
+                                mediaId: mediaId,
+                                filename: imageFilename,
+                                time: new Date().toLocaleTimeString()
+                            };
+                        } catch (err1k) {
+                            console.error(`[Auto-Upscaler] 1K Download error on ${mediaId}:`, err1k);
                         }
                     }
+                }
 
-                    // Handle Failure: Auto-stop immediately
-                    // If 2K was skipped because the model lacks 2K submenu, that is not a failure if 1K is enabled and succeeded
-                    const failed2k = do2k && !success2k && (!skipped2k || !do1k);
-                    const failed1k = do1k && !success1k;
-                    if (failed2k || failed1k) {
-                        const cb = document.querySelector(`.upscaler-checkbox[value="${mediaId}"]`);
-                        const targetOverlay = (cb && cb.parentElement) || item.tile?.querySelector('.upscaler-tile-overlay');
-                        if (targetOverlay) targetOverlay.style.backgroundColor = 'rgba(244, 67, 54, 0.8)';
-
-                        const lastInfoText = lastSuccessfulDownload
-                            ? `${lastSuccessfulDownload.filename} at ${lastSuccessfulDownload.time}`
-                            : 'None';
-
-                        statusCard.style.backgroundColor = '#3b1818';
-                        statusCard.style.borderColor = '#F44336';
-                        statusCard.style.color = '#ff9999';
-                        statusCard.textContent = `❌ STOPPED ON FAILURE!\nFailed on: ${mediaId.slice(0, 8)} (${failed2k ? '2K failed' : '1K failed'})\nDownloaded so far: ${totalDownloaded - 1}\nLast success: ${lastInfoText}`;
-
-                        activeBtn.innerText = `Stopped (${totalDownloaded - 1} downloaded)`;
-                        activeBtn.style.backgroundColor = '#F44336';
-                        activeBtn.disabled = false;
-                        return;
-                    }
-
-                    // Success visual
+                // Handle Failure: Auto-stop immediately
+                const failed2k = do2k && !success2k && (!skipped2k || !do1k);
+                const failed1k = do1k && !success1k;
+                if (failed2k || failed1k) {
                     const cb = document.querySelector(`.upscaler-checkbox[value="${mediaId}"]`);
                     const targetOverlay = (cb && cb.parentElement) || item.tile?.querySelector('.upscaler-tile-overlay');
-                    if (targetOverlay) targetOverlay.style.backgroundColor = 'rgba(76, 175, 80, 0.8)';
-                    if (cb) {
-                        cb.checked = false;
-                        updateSelectedCount();
-                    }
+                    if (targetOverlay) targetOverlay.style.backgroundColor = 'rgba(244, 67, 54, 0.8)';
 
-                    activeBtn.innerText = `Downloaded: ${totalDownloaded}`;
-                    statusCard.style.backgroundColor = '#1a1a1a';
-                    statusCard.style.borderColor = '#333';
-                    statusCard.style.color = '#ccc';
-                    statusCard.textContent = `Downloaded: ${totalDownloaded} images so far\nLast: ${lastSuccessfulDownload ? lastSuccessfulDownload.filename : mediaId.slice(0, 8)}`;
+                    const lastInfoText = lastSuccessfulDownload
+                        ? `${lastSuccessfulDownload.filename} at ${lastSuccessfulDownload.time}`
+                        : 'None';
 
-                    // Throttle between images
-                    const sleepTime = computeWaitMs(getSuccessOffset(), SUCCESS_WAIT_RAND_MIN, SUCCESS_WAIT_RAND_MAX);
-                    console.log(`[Auto-Upscaler] Success throttle — sleeping for ${sleepTime}ms...`);
-                    await sleep(sleepTime);
+                    statusCard.style.backgroundColor = '#3b1818';
+                    statusCard.style.borderColor = '#F44336';
+                    statusCard.style.color = '#ff9999';
+                    statusCard.textContent = `❌ STOPPED ON FAILURE!\nFailed on: ${mediaId.slice(0, 8)} (${failed2k ? '2K failed' : '1K failed'})\nDownloaded so far: ${totalDownloaded - 1}\nLast success: ${lastInfoText}`;
+
+                    activeBtn.innerText = `Stopped (${totalDownloaded - 1} downloaded)`;
+                    activeBtn.style.backgroundColor = '#F44336';
+                    activeBtn.disabled = false;
+                    window.__is_auto_downloader_running = false;
+                    window.__stop_auto_downloader = false;
+                    return;
                 }
+
+                // Success visual
+                const cb = document.querySelector(`.upscaler-checkbox[value="${mediaId}"]`);
+                const targetOverlay = (cb && cb.parentElement) || item.tile?.querySelector('.upscaler-tile-overlay');
+                if (targetOverlay) targetOverlay.style.backgroundColor = 'rgba(76, 175, 80, 0.8)';
+                if (cb) {
+                    cb.checked = false;
+                    updateSelectedCount();
+                }
+
+                activeBtn.innerText = `Stop (${totalDownloaded} downloaded)`;
+                statusCard.style.backgroundColor = '#1a1a1a';
+                statusCard.style.borderColor = '#333';
+                statusCard.style.color = '#ccc';
+                statusCard.textContent = `Downloaded: ${totalDownloaded} images so far\nLast: ${lastSuccessfulDownload ? lastSuccessfulDownload.filename : mediaId.slice(0, 8)}`;
+
+                // Throttle between images
+                const sleepTime = computeWaitMs(getSuccessOffset(), SUCCESS_WAIT_RAND_MIN, SUCCESS_WAIT_RAND_MAX);
+                console.log(`[Auto-Upscaler] Success throttle — sleeping for ${sleepTime}ms...`);
+                await sleep(sleepTime);
+
+                continue; // Immediately re-evaluate getVisibleUnprocessedTiles()!
             }
 
-            // All visible tiles processed! Scroll down to reveal the next batch.
+            // All visible tiles in current viewport processed! Now advance the viewport downwards.
             const currentTop = getScrollTop();
-            const maxScroll = getScrollHeight() - getClientHeight();
+            const maxScroll = Math.max(0, getScrollHeight() - getClientHeight());
 
-            if (currentTop >= maxScroll - 5) {
-                staleScrollCount++;
-                console.log(`[Auto-Upscaler] Reached bottom of collection. Stale check ${staleScrollCount}/4...`);
+            // Safe row step: ~320px (approx 1 row of images, never jumping an entire screen)
+            const step = Math.min(Math.max(Math.floor(getClientHeight() * 0.45), 250), 380);
+            const nextTop = Math.min(currentTop + step, maxScroll);
+
+            const didNotMove = Math.abs(currentTop - lastScrollTop) < 3 && currentTop === nextTop;
+            const reachedMax = currentTop >= maxScroll - 15;
+
+            if (didNotMove || reachedMax) {
+                staleChecksAtBottom++;
+                console.log(`[Auto-Upscaler] End of collection check ${staleChecksAtBottom}/4 (currentTop: ${currentTop}, max: ${maxScroll}). Waiting for potential new tiles...`);
+                statusCard.textContent = `Downloaded: ${totalDownloaded} | Reached bottom. Verifying completion (${staleChecksAtBottom}/4)...`;
+                setScrollTop(maxScroll, 'auto');
+                await sleep(1000); // Give Angular virtual scroll / backend pagination time to load
             } else {
-                staleScrollCount = 0;
+                console.log(`[Auto-Upscaler] Advancing viewport from ${currentTop} to ${nextTop} (max: ${maxScroll})...`);
+                setScrollTop(nextTop, 'auto');
+                lastScrollTop = currentTop;
+                await sleep(700); // Allow virtual scroll to hydrate newly revealed row
             }
-
-            const scrollAmount = Math.max(getClientHeight() * 0.75, 500);
-            const nextTop = Math.min(currentTop + scrollAmount, maxScroll);
-            console.log(`[Auto-Upscaler] Scrolling viewport from ${currentTop} to ${nextTop} (max: ${maxScroll})...`);
-            setScrollTop(nextTop);
-            await sleep(800); // Give Angular virtual scroll time to render the next batch
         }
 
-        // Finished entire collection!
-        activeBtn.innerText = `Done! (${totalDownloaded} downloaded)`;
-        activeBtn.style.backgroundColor = '#4CAF50';
-        activeBtn.disabled = false;
+        window.__is_auto_downloader_running = false;
+        window.__stop_auto_downloader = false;
 
-        statusCard.style.backgroundColor = '#1b381b';
-        statusCard.style.borderColor = '#4CAF50';
-        statusCard.style.color = '#81C784';
-        statusCard.textContent = `✅ Collection complete!\nTotal downloaded: ${totalDownloaded} images.`;
+        if (staleChecksAtBottom >= 4) {
+            // Finished entire collection cleanly!
+            activeBtn.innerText = `Done! (${totalDownloaded} downloaded)`;
+            activeBtn.style.backgroundColor = '#4CAF50';
+            activeBtn.disabled = false;
 
-        setTimeout(() => {
+            statusCard.style.backgroundColor = '#1b381b';
+            statusCard.style.borderColor = '#4CAF50';
+            statusCard.style.color = '#81C784';
+            statusCard.textContent = `✅ Collection complete!\nTotal downloaded: ${totalDownloaded} images.`;
+
+            setTimeout(() => {
+                activeBtn.innerText = originalBtnText;
+                activeBtn.style.backgroundColor = originalBtnColor;
+            }, 6000);
+        } else {
             activeBtn.innerText = originalBtnText;
             activeBtn.style.backgroundColor = originalBtnColor;
-        }, 4000);
+            activeBtn.disabled = false;
+        }
     }
 
     async function processMediaList(itemsList, activeBtn) {
@@ -1729,6 +1801,12 @@
     };
 
     btnDownloadCollection.onclick = async () => {
+        if (window.__is_auto_downloader_running) {
+            window.__stop_auto_downloader = true;
+            btnDownloadCollection.innerText = 'Stopping...';
+            btnDownloadCollection.disabled = true;
+            return;
+        }
         await runContinuousCollectionDownloader(btnDownloadCollection);
     };
 
