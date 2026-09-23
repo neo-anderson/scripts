@@ -910,6 +910,11 @@
         if (img) {
             return img.closest('flow-image-tile') || img.closest('flow-tile-container') || img.closest('.container') || img;
         }
+        const anyEl = document.querySelector(`[data-media-id="${mediaId}"]`) ||
+                      document.querySelector(`a[href*="${mediaId}"]`);
+        if (anyEl) {
+            return anyEl.closest('flow-image-tile') || anyEl.closest('flow-tile-container') || anyEl;
+        }
         return null;
     }
 
@@ -942,6 +947,7 @@
         const maxScroll = getScrollHeight() - getClientHeight();
         let currentTop = getScrollTop();
 
+        // 1. Search downwards from current position
         while (currentTop < maxScroll) {
             currentTop = Math.min(currentTop + 450, maxScroll);
             setScrollTop(currentTop);
@@ -953,6 +959,23 @@
                 return tile;
             }
         }
+
+        // 2. If not found downwards, rewind to top and search downwards
+        setScrollTop(0);
+        await sleep(350);
+        currentTop = 0;
+        while (currentTop < maxScroll) {
+            currentTop = Math.min(currentTop + 450, maxScroll);
+            setScrollTop(currentTop);
+            await sleep(350);
+            tile = findTileForMediaId(mediaId);
+            if (tile) {
+                tile.scrollIntoView({ block: 'center', behavior: 'smooth' });
+                await sleep(400);
+                return tile;
+            }
+        }
+
         return null;
     }
 
@@ -1122,12 +1145,20 @@
         const collected = new Map(); // mediaId -> { mediaId, prompt, model, created }
 
         function harvestVisibleTiles() {
-            const imgs = document.querySelectorAll('img[data-media-id]');
+            const selector = 'img[data-media-id], flow-image-tile img, img[src*="media.getMediaUrlRedirect"], img[src*="name="]';
+            const imgs = document.querySelectorAll(selector);
             imgs.forEach(img => {
-                const mid = img.dataset.mediaId;
-                if (mid && !collected.has(mid)) {
-                    const meta = getImageMetadata(mid);
-                    collected.set(mid, { mediaId: mid, ...meta });
+                let mid = img.dataset.mediaId || img.getAttribute('data-media-id') || '';
+                if (!mid && img.src) {
+                    const match = img.src.match(/name=([0-9a-f-]+)/i) || img.src.match(/\/([0-9a-f-]{36})/i);
+                    if (match) mid = match[1];
+                }
+                if (mid) {
+                    img.dataset.mediaId = mid;
+                    if (!collected.has(mid)) {
+                        const meta = getImageMetadata(mid);
+                        collected.set(mid, { mediaId: mid, ...meta });
+                    }
                 }
             });
         }
