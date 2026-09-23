@@ -115,3 +115,24 @@ This document records the architectural decisions, reverse-engineering findings,
 - **Single JSON Sidecar**: Consolidated prompt, model tag (`ai:model:*`), and creation date into a single structured `<filename>.json` sidecar.
 - **Trusted Types & CSP Compliance**: Eliminated all `innerHTML` usage to strictly conform to Google's strict Trusted Types Content Security Policy.
 - **Floating Panel UI**: Draggable, collapsible UI overlay mounted on the page with live Auth and reCAPTCHA status indicators.
+
+---
+
+## Operating Guidelines & Browser Reliability Matrix
+
+Because Google Flow relies on Angular Material context menus, dynamic DOM virtual scrolling, and native UI events for 2K upscaling (which requires human trust scores), browser window states directly impact automation reliability:
+
+| Scenario / Browser State | Status | Behavior & Architectural Cause | Operational Recommendation |
+| :--- | :---: | :--- | :--- |
+| **Resizing / Changing Browser Width** | ✅ **100% Reliable** | Elements are queried by DOM attributes (`data-media-id`, etc.) rather than fixed coordinates. `findAndScrollToTile` automatically calls `scrollIntoView({ block: 'center' })` before right-clicking, and viewport scroll steps are calculated dynamically (`0.75 * clientHeight`). | Safe to resize, tile, widen, or narrow at any time. |
+| **Separate Window Behind Other Windows** | ✅ **100% Reliable** | As long as the window is not minimized, Chromium renders paint cycles and executes JavaScript timers (`setTimeout`) at standard speed. | Safe to place code editors, other apps, or browser windows in front. |
+| **Moving Window to Another macOS Space / Desktop** | ✅ **100% Reliable** | Virtual desktop spaces remain active rendering contexts in macOS window managers; background throttling is avoided. | **Recommended workflow** for running long collection downloads in the background. |
+| **Switching to Another Tab in Same Window** | ❌ **Will Pause / Fail** | Chromium completely freezes `requestAnimationFrame` on hidden tabs. Angular Material context menu animations (`@transformMenu`) pause, causing `waitForOverlayElement` to hit its 5-second timeout and fail. | **Do not switch tabs.** Instead, tear the Google Flow tab out into its own standalone browser window. |
+| **Minimizing Window to macOS Dock (`Cmd+M`)** | ⚠️ **Unreliable / Stalls** | macOS/Chromium suspends window rendering and heavily clamps JavaScript timer execution to 1 Hz or lower. Smooth scrolling and virtual node hydration stall. | Do not minimize to the Dock. |
+
+### How to Run Reliable Unattended Downloads
+1. **Tear Off Tab**: Pull the Google Flow tab out into its own dedicated Chrome window.
+2. **Keep Tab Active in Its Window**: Leave Google Flow as the foreground tab in that window.
+3. **Move to Background Space / Behind Other Windows**: Move that window to another macOS Space or leave it behind your active work windows. Do not minimize it.
+4. **Start Auto-Downloader**: Click **Auto Scroll & Download Collection**. The script will run continuously until the entire collection has been processed.
+
