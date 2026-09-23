@@ -5,7 +5,7 @@
 // @match       https://flow.google.com/project/*
 // @match       https://labs.google/fx/tools/flow/project/*
 // @grant       none
-// @version     2.8.4
+// @version     2.8.5
 // ==/UserScript==
 
 // JSON sidecar instead of ⁠.txt + ⁠.md — a single ⁠image-filename.ext.json is written per image via the new ⁠buildJson(), producing exactly your target shape:
@@ -34,9 +34,30 @@
 (function() {
     'use strict';
 
-    const SCRIPT_VERSION = 'v2.8.4';
+    const SCRIPT_VERSION = 'v2.8.5';
 
     console.log(`[Auto-Upscaler ${SCRIPT_VERSION}] Script loaded on:`, window.location.href);
+
+    // Active upscale download tracker to capture and rename native Google Flow 2K downloads
+    window.__active_upscale_download = null;
+
+    const originalAnchorClick = HTMLAnchorElement.prototype.click;
+    HTMLAnchorElement.prototype.click = function() {
+        try {
+            if (window.__active_upscale_download && this.download && (this.download.includes('_2K_') || this.download.endsWith('.jpeg') || this.download.endsWith('.jpg') || this.download.endsWith('.png'))) {
+                const current = window.__active_upscale_download;
+                console.log(`[Auto-Upscaler] Intercepting native 2K download: "${this.download}" -> "${current.targetFilename}"`);
+                this.download = current.targetFilename;
+                if (typeof current.resolve === 'function') {
+                    current.resolve(this.download);
+                }
+                window.__active_upscale_download = null;
+            }
+        } catch (e) {
+            console.warn('[Auto-Upscaler] Error in anchor click hook:', e);
+        }
+        return originalAnchorClick.apply(this, arguments);
+    };
 
     // Store tokens intercepted from normal page traffic or Google BOQ WIZ data
     window.__upscale_tokens = {
@@ -861,6 +882,135 @@
         return null;
     }
 
+    function findTileForMediaId(mediaId) {
+        const cb = document.querySelector(`.upscaler-checkbox[value="${mediaId}"]`);
+        if (cb) {
+            const tile = cb.closest('flow-image-tile') || cb.closest('flow-tile-container') || cb.closest('.container') || cb.parentElement?.parentElement;
+            if (tile) return tile;
+        }
+        const img = document.querySelector(`img[data-media-id="${mediaId}"]`) ||
+                    document.querySelector(`img[src*="${mediaId}"]`);
+        if (img) {
+            return img.closest('flow-image-tile') || img.closest('flow-tile-container') || img.closest('.container') || img;
+        }
+        return null;
+    }
+
+    async function waitForOverlayElement(predicate, timeoutMs = 5000) {
+        const start = Date.now();
+        while (Date.now() - start < timeoutMs) {
+            const found = predicate();
+            if (found) return found;
+            await sleep(100);
+        }
+        return null;
+    }
+
+    async function findAndScrollToTile(mediaId) {
+        let tile = findTileForMediaId(mediaId);
+        if (tile) {
+            tile.scrollIntoView({ block: 'center', behavior: 'smooth' });
+            await sleep(400);
+            return tile;
+        }
+
+        // Virtual scroll search
+        const scroller = findScrollableContainer();
+        const isWindow = (scroller === window || scroller === document.body || scroller === document.documentElement || scroller === document.scrollingElement);
+        const getScrollTop = () => isWindow ? (window.pageYOffset || document.documentElement.scrollTop) : scroller.scrollTop;
+        const setScrollTop = (val) => isWindow ? window.scrollTo({ top: val, behavior: 'smooth' }) : scroller.scrollTo({ top: val, behavior: 'smooth' });
+        const getScrollHeight = () => isWindow ? document.documentElement.scrollHeight : scroller.scrollHeight;
+        const getClientHeight = () => isWindow ? window.innerHeight : scroller.clientHeight;
+
+        const maxScroll = getScrollHeight() - getClientHeight();
+        let currentTop = getScrollTop();
+
+        while (currentTop < maxScroll) {
+            currentTop = Math.min(currentTop + 450, maxScroll);
+            setScrollTop(currentTop);
+            await sleep(350);
+            tile = findTileForMediaId(mediaId);
+            if (tile) {
+                tile.scrollIntoView({ block: 'center', behavior: 'smooth' });
+                await sleep(400);
+                return tile;
+            }
+        }
+        return null;
+    }
+
+    async function triggerNative2KUpscale(mediaId, targetFilename, timeoutMs = 60000) {
+        return new Promise(async (resolve, reject) => {
+            let timer = null;
+            window.__active_upscale_download = {
+                mediaId,
+                targetFilename,
+                resolve: (filename) => {
+                    if (timer) clearTimeout(timer);
+                    resolve(filename);
+                },
+                reject: (err) => {
+                    if (timer) clearTimeout(timer);
+                    reject(err);
+                }
+            };
+
+            timer = setTimeout(() => {
+                window.__active_upscale_download = null;
+                reject(new Error(`Timeout (${timeoutMs / 1000}s) waiting for 2K upscale download for ${mediaId}`));
+            }, timeoutMs);
+
+            try {
+                // Close any open overlays or menus
+                document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }));
+                await sleep(150);
+
+                const tile = await findAndScrollToTile(mediaId);
+                if (!tile) {
+                    throw new Error(`Tile element for ${mediaId} not found in DOM`);
+                }
+
+                // Dispatch contextmenu on tile
+                const rect = tile.getBoundingClientRect();
+                const evt = new MouseEvent('contextmenu', {
+                    bubbles: true,
+                    cancelable: true,
+                    view: window,
+                    button: 2,
+                    buttons: 2,
+                    clientX: rect.left + rect.width / 2,
+                    clientY: rect.top + rect.height / 2
+                });
+                tile.dispatchEvent(evt);
+
+                // Wait for context menu to render and find "Download"
+                const downloadBtn = await waitForOverlayElement(() => {
+                    return Array.from(document.querySelectorAll('.cdk-overlay-container *'))
+                        .find(el => el.textContent && el.textContent.trim() === 'Download' && el.children.length === 0)
+                        ?.closest('button, [role="menuitem"], .mat-mdc-menu-item, div');
+                }, 5000);
+
+                if (!downloadBtn) throw new Error(`"Download" menu item not found for ${mediaId}`);
+                downloadBtn.click();
+
+                // Wait for 2K submenu and find "2K"
+                const btn2k = await waitForOverlayElement(() => {
+                    const spans = Array.from(document.querySelectorAll('.cdk-overlay-container *'))
+                        .filter(e => e.children.length === 0 && e.textContent.trim() === '2K');
+                    return spans.map(s => s.closest('button, [role="menuitem"], .mat-mdc-menu-item, div')).find(Boolean) || spans[0];
+                }, 5000);
+
+                if (!btn2k) throw new Error(`"2K" submenu item not found for ${mediaId}`);
+                btn2k.click();
+                console.log(`[Auto-Upscaler] Dispatched native 2K click for ${mediaId}, awaiting download...`);
+            } catch (err) {
+                window.__active_upscale_download = null;
+                if (timer) clearTimeout(timer);
+                reject(err);
+            }
+        });
+    }
+
     function parseBatchExecuteResponse(responseText) {
         if (!responseText) return null;
 
@@ -1013,8 +1163,8 @@
         const t = window.__upscale_tokens;
         extractTokensFromWiz();
         const isAuthReady = !!(t.at || t.authToken);
-        if (do2k && !isAuthReady) {
-            alert("Cannot upscale yet! Wait for Auth token to turn green (✅).");
+        if (do1k && !isAuthReady) {
+            alert("Cannot download 1K yet! Wait for Auth token to turn green (✅).");
             return;
         }
 
@@ -1140,48 +1290,21 @@
             // 1. Process 2K Upscale if requested
             if (do2k) {
                 try {
-                    const freshToken = await getFreshRecaptchaToken();
-                    if (!freshToken) {
-                        console.error(`[Auto-Upscaler] Cannot upscale ${mediaId}: no reCAPTCHA token available.`);
+                    console.log(`[Auto-Upscaler] Triggering native 2K upscale for ${mediaId}...`);
+                    const targetFilename = `GoogleFlow_2K_${mediaId}.jpg`;
+                    const downloadedFilename = await triggerNative2KUpscale(mediaId, targetFilename, 60000);
+                    if (downloadedFilename) {
+                        console.log(`[Auto-Upscaler] 2K Success for ${mediaId}: ${downloadedFilename}`);
+                        await writeSidecar(mediaId, downloadedFilename, true, item.meta);
+                        success2k = true;
+                        currentDownloadedFilename = downloadedFilename;
+                        lastSuccessfulDownload = {
+                            mediaId: mediaId,
+                            filename: downloadedFilename,
+                            time: new Date().toLocaleTimeString()
+                        };
                     } else {
-                        let base64Data = null;
-                        if (window.location.hostname.includes('flow.google.com') || t.at) {
-                            console.log(`[Auto-Upscaler] Sending 2K upscale via SPrCad batchexecute for ${mediaId}...`);
-                            const res = await sendBatchExecuteUpscale(mediaId, freshToken);
-                            if (res && res.ok) {
-                                const text = await res.text();
-                                base64Data = parseBatchExecuteResponse(text);
-                                if (!base64Data) {
-                                    console.error(`[Auto-Upscaler] Could not find base64 image in SPrCad response for ${mediaId}:`, text.substring(0, 300));
-                                }
-                            } else {
-                                const errText = res ? await res.text() : 'No response';
-                                console.error(`[Auto-Upscaler] 2K Upscale failed for ${mediaId}:`, errText);
-                            }
-                        } else {
-                            const res = await sendRequest(makePayload(mediaId, freshToken, "UPSAMPLE_IMAGE_RESOLUTION_2K"));
-                            if (res && res.ok) {
-                                const data = await res.json();
-                                base64Data = data.encodedImage || null;
-                            } else {
-                                const errText = res ? await res.text() : 'No response';
-                                console.error(`[Auto-Upscaler] 2K Upscale failed for ${mediaId}:`, errText);
-                            }
-                        }
-
-                        if (base64Data) {
-                            console.log(`[Auto-Upscaler] 2K Success for ${mediaId}`);
-                            const imageFilename = `GoogleFlow_2K_${mediaId}.jpg`;
-                            downloadBase64(base64Data, imageFilename);
-                            await writeSidecar(mediaId, imageFilename, true, item.meta);
-                            success2k = true;
-                            currentDownloadedFilename = imageFilename;
-                            lastSuccessfulDownload = {
-                                mediaId: mediaId,
-                                filename: imageFilename,
-                                time: new Date().toLocaleTimeString()
-                            };
-                        }
+                        console.error(`[Auto-Upscaler] 2K Upscale failed for ${mediaId}: No download recorded`);
                     }
                 } catch (err2k) {
                     console.error(`[Auto-Upscaler] 2K Upscale error on ${mediaId}:`, err2k);
@@ -1355,8 +1478,8 @@
         const t = window.__upscale_tokens;
         extractTokensFromWiz();
         const isAuthReady = !!(t.at || t.authToken);
-        if (do2k && !isAuthReady) {
-            alert("Cannot upscale yet! Wait for Auth token to turn green (✅).");
+        if (do1k && !isAuthReady) {
+            alert("Cannot download 1K yet! Wait for Auth token to turn green (✅).");
             return;
         }
 
