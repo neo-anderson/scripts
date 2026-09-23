@@ -7,6 +7,13 @@ This document records the architectural decisions, reverse-engineering findings,
 
 ## Version History
 
+### v2.8.6 (2026-09-22) — Inter-Resolution Throttling
+- **Changes**:
+  - Replaced the hardcoded 400ms pause between 2K and 1K downloads on the same image with the full randomized success throttle (`offset + rand(1..3)s`).
+  - Ensures uniform, safe, human-like spacing between all operations (2K $\rightarrow$ 1K and Image $n$ $\rightarrow$ Image $n+1$).
+
+---
+
 ### v2.8.5 (2026-09-22) — Native UI Automation & Standardized Naming
 - **Problem**:
   - Direct backend RPC calls to `SPrCad` (`batchexecute`) consistently failed with `PUBLIC_ERROR_UNUSUAL_ACTIVITY` (gRPC status 7: `PERMISSION_DENIED`).

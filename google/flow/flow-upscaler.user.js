@@ -5,10 +5,12 @@
 // @match       https://flow.google.com/project/*
 // @match       https://labs.google/fx/tools/flow/project/*
 // @grant       none
-// @version     2.8.5
+// @version     2.8.6
 // ==/UserScript==
 
 // --- VERSION LOG ---
+// v2.8.6: Inter-Resolution Throttle
+//   - Added randomized throttle between 2K and 1K downloads on the same image (offset + rand(1..3)s) to match inter-image spacing.
 // v2.8.5: Native UI Driving for 2K Upscaling & Standardized Naming
 //   - Fixed PUBLIC_ERROR_UNUSUAL_ACTIVITY by driving Google Flow's native contextmenu -> "Download" -> "2K" flow.
 //   - Native Angular UI calls pass reCAPTCHA Enterprise with human trust scores (isTrusted: true).
@@ -51,7 +53,7 @@
 (function() {
     'use strict';
 
-    const SCRIPT_VERSION = 'v2.8.5';
+    const SCRIPT_VERSION = 'v2.8.6';
 
     console.log(`[Auto-Upscaler ${SCRIPT_VERSION}] Script loaded on:`, window.location.href);
 
@@ -1367,7 +1369,9 @@
                 } else {
                     try {
                         if (do2k && success2k) {
-                            await sleep(400); // brief pause between 2K and 1K downloads for same image
+                            const interSleep = computeWaitMs(getSuccessOffset(), SUCCESS_WAIT_RAND_MIN, SUCCESS_WAIT_RAND_MAX);
+                            console.log(`[Auto-Upscaler] Inter-resolution throttle — pausing ${interSleep}ms between 2K and 1K for ${mediaId}...`);
+                            await sleep(interSleep);
                         }
                         console.log(`[Auto-Upscaler] Downloading 1K default for ${mediaId}...`);
                         const imageFilename = `GoogleFlow_1K_${mediaId}.jpg`;
