@@ -26,6 +26,7 @@ Violentmonkey userscript for [Google Flow](https://flow.google.com/) that automa
   }
   ```
 - **Continuous Auto-Scroll & Download**: Downloads all visible images on screen, smoothly scrolls down to hydrate the next batch via Angular's virtual scroller, and repeats continuously with a live progress counter.
+- **Graceful Non-2K Model Fallback**: Detects whether an image tile has a direct "Download" button versus a "2K" submenu. If 2K is unsupported for that image, skips 2K without errors and seamlessly downloads the 1K original version.
 - **Selective Batch Downloading**: Select specific image tiles via checkboxes and click "Upscale / Download Selected".
 - **Humanized Throttling**: Randomized pauses (`offset + rand(1..3)s`) between operations and resolutions to prevent rate limiting.
 - **Fail-Safe Auto-Stop**: Halts immediately on failure to preserve quotas and logs the last successful download.

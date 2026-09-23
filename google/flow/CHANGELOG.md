@@ -7,6 +7,19 @@ This document records the architectural decisions, reverse-engineering findings,
 
 ## Version History
 
+### v2.8.9 (2026-09-22) — Graceful Fallback for Non-2K Models
+- **Context & Requirement**:
+  - In Google Flow, some images (e.g. certain models or workflows) do not support 2K upscaling.
+  - On these tiles, right-clicking reveals a direct "Download" button rather than a menu item that opens a submenu with "1K" and "2K" options.
+  - Previously, attempting to upscale these tiles caused `triggerNative2KUpscale` to time out waiting for the "2K" submenu, halting the continuous collection runner with a false failure stop.
+- **Solution**:
+  - Updated `triggerNative2KUpscale` to inspect whether the "Download" menu item opens a "2K" submenu or acts as a direct button.
+  - If no "2K" submenu is present after opening the menu, the script gracefully resolves with `{ status: 'skipped_no_2k' }` and dismisses the context menu (`Escape`).
+  - Both `runContinuousCollectionDownloader` and `processMediaList` automatically proceed to download the 1K original version if 1K downloading is enabled in the floating panel.
+  - Non-2K images are not flagged as failures when 1K download succeeds.
+
+---
+
 ### v2.8.8 (2026-09-22) — Scope Fix for Continuous Downloader Sidecars
 - **Problem**:
   - Running "Auto Scroll & Download Collection" successfully upscaled and saved the 2K image with renaming (`GoogleFlow_2K_<mediaId>.jpg`), but immediately halted with `STOPPED ON FAILURE! Failed on: <mediaId> (2K failed)` without writing the `.json` sidecar or proceeding to the 1K download.

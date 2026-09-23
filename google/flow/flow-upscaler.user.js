@@ -5,10 +5,14 @@
 // @match       https://flow.google.com/project/*
 // @match       https://labs.google/fx/tools/flow/project/*
 // @grant       none
-// @version     2.8.8
+// @version     2.8.9
 // ==/UserScript==
 
 // --- VERSION LOG ---
+// v2.8.9: Graceful Fallback for Models Without 2K Upscaling
+//   - Detects whether the native context menu "Download" item opens a 2K submenu or is a direct download button.
+//   - If an image lacks 2K upscaling (direct download button without 2K submenu), gracefully skips 2K without triggering false failure stops.
+//   - Automatically downloads the 1K original version if 1K downloading is enabled in the floating panel.
 // v2.8.8: Scope Fix for Continuous Downloader Sidecars
 //   - Lifted downloadText, downloadUrl, downloadBase64, and writeSidecar to module scope.
 //   - Fixed ReferenceError: downloadText is not defined in runContinuousCollectionDownloader that caused 2K sidecars to fail and prematurely halt auto-scroll download.
@@ -60,7 +64,7 @@
 (function() {
     'use strict';
 
-    const SCRIPT_VERSION = 'v2.8.8';
+    const SCRIPT_VERSION = 'v2.8.9';
 
     console.log(`[Auto-Upscaler ${SCRIPT_VERSION}] Script loaded on:`, window.location.href);
 
@@ -1042,14 +1046,24 @@
                 if (!downloadBtn) throw new Error(`"Download" menu item not found for ${mediaId}`);
                 downloadBtn.click();
 
-                // Wait for 2K submenu and find "2K"
+                // Wait up to 1.8s for 2K submenu to render
                 const btn2k = await waitForOverlayElement(() => {
                     const spans = Array.from(document.querySelectorAll('.cdk-overlay-container *'))
                         .filter(e => e.children.length === 0 && e.textContent.trim() === '2K');
                     return spans.map(s => s.closest('button, [role="menuitem"], .mat-mdc-menu-item, div')).find(Boolean) || spans[0];
-                }, 5000);
+                }, 1800);
 
-                if (!btn2k) throw new Error(`"2K" submenu item not found for ${mediaId}`);
+                if (!btn2k) {
+                    // Download is a direct download button or has no 2K submenu (e.g. models without 2K support)
+                    console.log(`[Auto-Upscaler] "2K" submenu not present on ${mediaId} — skipping 2K`);
+                    window.__active_upscale_download = null;
+                    if (timer) clearTimeout(timer);
+                    // Dismiss any open overlay menu
+                    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }));
+                    resolve({ status: 'skipped_no_2k' });
+                    return;
+                }
+
                 btn2k.click();
                 console.log(`[Auto-Upscaler] Dispatched native 2K click for ${mediaId}, awaiting download...`);
             } catch (err) {
@@ -1278,6 +1292,7 @@
                     console.log(`[Auto-Upscaler] Continuous Download #${totalDownloaded}: ${mediaId}`);
 
                     let success2k = false;
+                    let skipped2k = false;
                     let success1k = false;
                     let downloadedFilename = '';
 
@@ -1285,8 +1300,12 @@
                     if (do2k) {
                         try {
                             const targetFilename = `GoogleFlow_2K_${mediaId}.jpg`;
-                            downloadedFilename = await triggerNative2KUpscale(mediaId, targetFilename, 60000);
-                            if (downloadedFilename) {
+                            const res2k = await triggerNative2KUpscale(mediaId, targetFilename, 60000);
+                            if (res2k && res2k.status === 'skipped_no_2k') {
+                                console.log(`[Auto-Upscaler] Image ${mediaId} does not support 2K upscaling (direct Download button).`);
+                                skipped2k = true;
+                            } else if (res2k && typeof res2k === 'string') {
+                                downloadedFilename = res2k;
                                 console.log(`[Auto-Upscaler] 2K Success for ${mediaId}: ${downloadedFilename}`);
                                 const meta = getImageMetadata(mediaId);
                                 await writeSidecar(mediaId, downloadedFilename, true, meta);
@@ -1306,8 +1325,8 @@
 
                     // 2. Process 1K if requested
                     if (do1k) {
-                        if (do2k && !success2k) {
-                            // 2K failed, skip 1K
+                        if (do2k && !success2k && !skipped2k) {
+                            // 2K failed on an actual error (not a model without 2K support), skip 1K
                         } else {
                             try {
                                 if (do2k && success2k) {
@@ -1346,7 +1365,8 @@
                     }
 
                     // Handle Failure: Auto-stop immediately
-                    const failed2k = do2k && !success2k;
+                    // If 2K was skipped because the model lacks 2K submenu, that is not a failure if 1K is enabled and succeeded
+                    const failed2k = do2k && !success2k && (!skipped2k || !do1k);
                     const failed1k = do1k && !success1k;
                     if (failed2k || failed1k) {
                         const cb = document.querySelector(`.upscaler-checkbox[value="${mediaId}"]`);
@@ -1500,6 +1520,7 @@
             console.log(`[Auto-Upscaler] Processing ${mediaId} (${countLabel})...`);
 
             let success2k = false;
+            let skipped2k = false;
             let success1k = false;
             let currentDownloadedFilename = '';
 
@@ -1508,8 +1529,12 @@
                 try {
                     console.log(`[Auto-Upscaler] Triggering native 2K upscale for ${mediaId}...`);
                     const targetFilename = `GoogleFlow_2K_${mediaId}.jpg`;
-                    const downloadedFilename = await triggerNative2KUpscale(mediaId, targetFilename, 60000);
-                    if (downloadedFilename) {
+                    const res2k = await triggerNative2KUpscale(mediaId, targetFilename, 60000);
+                    if (res2k && res2k.status === 'skipped_no_2k') {
+                        console.log(`[Auto-Upscaler] Image ${mediaId} does not support 2K upscaling (direct Download button).`);
+                        skipped2k = true;
+                    } else if (res2k && typeof res2k === 'string') {
+                        const downloadedFilename = res2k;
                         console.log(`[Auto-Upscaler] 2K Success for ${mediaId}: ${downloadedFilename}`);
                         await writeSidecar(mediaId, downloadedFilename, true, item.meta);
                         success2k = true;
@@ -1529,8 +1554,8 @@
 
             // 2. Process Default 1K if requested
             if (do1k) {
-                // If 2K was requested and failed, do not proceed to 1K
-                if (do2k && !success2k) {
+                // If 2K was requested and failed on an actual error (not a model without 2K support), do not proceed to 1K
+                if (do2k && !success2k && !skipped2k) {
                     // 2K failed, skip 1K
                 } else {
                     try {
@@ -1600,7 +1625,8 @@
             }
 
             // Determine if this item failed
-            const failed2k = do2k && !success2k;
+            // If 2K was skipped because the model lacks 2K submenu, that is not a failure if 1K is enabled and succeeded
+            const failed2k = do2k && !success2k && (!skipped2k || !do1k);
             const failed1k = do1k && !success1k;
             const isFailure = failed2k || failed1k;
 
