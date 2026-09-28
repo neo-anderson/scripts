@@ -40,19 +40,18 @@ Because the script drives native UI elements (Angular Material context menus) an
 | Scenario / Browser State | Status | Behavior & Technical Cause | Operational Recommendation |
 | :--- | :---: | :--- | :--- |
 | **Resizing / Changing Browser Width** | ✅ **100% Reliable** | Elements are queried by DOM attributes (`data-media-id`, etc.) rather than fixed coordinate grids. `findAndScrollToTile` automatically calls `scrollIntoView({ block: 'center' })` before right-clicking, and viewport scroll steps are calculated dynamically (`0.75 * clientHeight`). | Safe to resize, tile, widen, or narrow at any time. |
-| **Separate Window Behind Other Windows** | ✅ **100% Reliable** | As long as the window is not minimized, Chromium renders paint cycles and executes JavaScript timers (`setTimeout`) at standard speed. | Safe to place code editors, other apps, or browser windows in front. |
-| **Moving Window to Another macOS Space / Desktop** | ✅ **100% Reliable** | Virtual desktop spaces remain active rendering contexts in macOS window managers; background throttling is avoided. | **Recommended workflow** for running long collection downloads in the background. |
-| **Switching to Another Tab in Same Window** | ❌ **Will Pause / Fail** | Chromium completely freezes `requestAnimationFrame` on hidden tabs. Angular Material context menu animations (`@transformMenu`) pause, causing `waitForOverlayElement` to hit its 5-second timeout and fail. | **Do not switch tabs.** Instead, tear the Google Flow tab out into its own standalone browser window. |
-| **Minimizing Window to macOS Dock (`Cmd+M`)** | ⚠️ **Unreliable / Stalls** | macOS/Chromium suspends window rendering and heavily clamps JavaScript timer execution to 1 Hz or lower. Smooth scrolling and virtual node hydration stall. | Do not minimize to the Dock. |
+| **Moving Window to Another macOS Space / Desktop** | ✅ **100% Reliable** | macOS Spaces remain active rendering surfaces for unminimized windows without occlusion throttling. | **Recommended workflow**: place Google Flow on a secondary Space / virtual desktop. |
+| **Separate Window Fully Covered on Same Space** | ⚠️ **Throttled / Occluded** | When 100% covered by an opaque window (like a code editor), macOS **App Nap** and Chromium **Window Occlusion Tracking** throttle JS timers and pause CSS transitions. | **Do not completely cover.** Either leave an edge visible, or swipe the window to a separate macOS Space. |
+| **Switching to Another Tab in Same Window** | ❌ **Will Pause / Fail** | Chromium completely freezes `requestAnimationFrame` on hidden tabs. Angular Material context menu animations pause, causing timeouts. | **Do not switch tabs.** Tear the Google Flow tab out into its own standalone browser window. |
+| **Minimizing Window to macOS Dock (`Cmd+M`)** | ❌ **Suspended** | macOS and Chromium suspend window rendering and clamp timers down to $\le 1$ Hz. | Do not minimize to the Dock. |
 
 ---
 
 ## How to Run Reliable Unattended Downloads
 
-1. **Tear Off the Tab**: Pull the Google Flow tab out into its own dedicated Chrome window.
-2. **Keep Tab Active in Its Window**: Leave Google Flow as the foreground tab in that window.
-3. **Move to Background Space / Behind Other Windows**: Move that window to another macOS Space (Virtual Desktop) or leave it behind your active work windows. Do not minimize it to the Dock (`Cmd+M`).
-4. **Start Auto-Downloader**: Click **Auto Scroll & Download Collection**. The script will run continuously until the entire collection has been processed.
+1. **Tear Off the Tab**: Pull the Google Flow tab out into its own dedicated browser window.
+2. **Move to Another macOS Space (Virtual Desktop)**: Swipe the window to another Space (e.g. Desktop 2) so macOS keeps its rendering pipeline active without App Nap or window occlusion throttling.
+3. **Start Auto-Downloader**: Click **Auto Scroll & Download Collection**. The script will automatically rewind to the top, download every row sequentially, and cleanly complete after a 10-second idle period once the bottom is reached.
 
 ---
 

@@ -5,10 +5,14 @@
 // @match       https://flow.google.com/project/*
 // @match       https://labs.google/fx/tools/flow/project/*
 // @grant       none
-// @version     2.8.11
+// @version     2.8.12
 // ==/UserScript==
 
 // --- VERSION LOG ---
+// v2.8.12: 10s Idle Completion Safeguard & Occlusion Resilience
+//   - Added 10-second idle completion safeguard: if no new unprocessed images appear in the DOM for 10 seconds, the runner finishes automatically and flags completion as successful.
+//   - Shows live countdown on the status card while searching/checking the collection boundary.
+//   - Added automatic context-menu retry and extended overlay wait timeouts to prevent premature failure stops caused by macOS window occlusion / App Nap throttling.
 // v2.8.11: Robust End-of-Collection Termination & Row-by-Row Order
 //   - Rewinds to top on start so earlier images are not missed if the user is scrolled down.
 //   - Sorts visible tiles top-to-bottom so downloads strictly proceed in natural reading order without leaping past rows.
@@ -73,7 +77,7 @@
 (function() {
     'use strict';
 
-    const SCRIPT_VERSION = 'v2.8.11';
+    const SCRIPT_VERSION = 'v2.8.12';
 
     console.log(`[Auto-Upscaler ${SCRIPT_VERSION}] Script loaded on:`, window.location.href);
 
@@ -1032,25 +1036,39 @@
                     throw new Error(`Tile element for ${mediaId} not found in DOM`);
                 }
 
-                // Dispatch contextmenu on tile
-                const rect = tile.getBoundingClientRect();
-                const evt = new MouseEvent('contextmenu', {
-                    bubbles: true,
-                    cancelable: true,
-                    view: window,
-                    button: 2,
-                    buttons: 2,
-                    clientX: rect.left + rect.width / 2,
-                    clientY: rect.top + rect.height / 2
-                });
-                tile.dispatchEvent(evt);
+                // Dispatch contextmenu on tile with retry for occluded/throttled background windows
+                const dispatchContextMenu = () => {
+                    const rect = tile.getBoundingClientRect();
+                    const evt = new MouseEvent('contextmenu', {
+                        bubbles: true,
+                        cancelable: true,
+                        view: window,
+                        button: 2,
+                        buttons: 2,
+                        clientX: rect.left + rect.width / 2,
+                        clientY: rect.top + rect.height / 2
+                    });
+                    tile.dispatchEvent(evt);
+                };
+
+                dispatchContextMenu();
 
                 // Wait for context menu to render and find "Download"
-                const downloadBtn = await waitForOverlayElement(() => {
+                let downloadBtn = await waitForOverlayElement(() => {
                     return Array.from(document.querySelectorAll('.cdk-overlay-container *'))
                         .find(el => el.textContent && el.textContent.trim() === 'Download' && el.children.length === 0)
                         ?.closest('button, [role="menuitem"], .mat-mdc-menu-item, div');
-                }, 5000);
+                }, 3500);
+
+                if (!downloadBtn) {
+                    console.log(`[Auto-Upscaler] "Download" not found in 3.5s on ${mediaId} — retrying contextmenu...`);
+                    dispatchContextMenu();
+                    downloadBtn = await waitForOverlayElement(() => {
+                        return Array.from(document.querySelectorAll('.cdk-overlay-container *'))
+                            .find(el => el.textContent && el.textContent.trim() === 'Download' && el.children.length === 0)
+                            ?.closest('button, [role="menuitem"], .mat-mdc-menu-item, div');
+                    }, 4500);
+                }
 
                 if (!downloadBtn) throw new Error(`"Download" menu item not found for ${mediaId}`);
 
@@ -1072,12 +1090,12 @@
                 // It has a submenu: click or dispatch mouseenter to open submenu
                 downloadBtn.click();
 
-                // Wait up to 3s for 2K submenu to render
+                // Wait up to 4s for 2K submenu to render
                 const btn2k = await waitForOverlayElement(() => {
                     const spans = Array.from(document.querySelectorAll('.cdk-overlay-container *'))
                         .filter(e => e.children.length === 0 && e.textContent.trim() === '2K');
                     return spans.map(s => s.closest('button, [role="menuitem"], .mat-mdc-menu-item, div')).find(Boolean) || spans[0];
-                }, 3000);
+                }, 4000);
 
                 if (!btn2k) {
                     console.log(`[Auto-Upscaler] "2K" submenu item not found on ${mediaId} — skipping 2K`);
@@ -1269,8 +1287,9 @@
 
         const processedMediaIds = new Set();
         let totalDownloaded = 0;
-        let staleChecksAtBottom = 0;
         let lastSuccessfulDownload = null;
+        let lastActivityTime = Date.now();
+        const IDLE_COMPLETION_MS = 10000; // 10 seconds of no new images found -> successfully complete collection run
 
         const scroller = findScrollableContainer();
         const isWindow = (scroller === window || scroller === document.body || scroller === document.documentElement || scroller === document.scrollingElement);
@@ -1341,7 +1360,7 @@
 
         let lastScrollTop = -1;
 
-        while (staleChecksAtBottom < 4) {
+        while (true) {
             if (window.__stop_auto_downloader) {
                 console.log('[Auto-Upscaler] Continuous download stopped by user.');
                 statusCard.textContent = `⏹ Stopped by user.\nTotal downloaded: ${totalDownloaded} images.`;
@@ -1351,7 +1370,7 @@
             const unprocessed = getVisibleUnprocessedTiles();
 
             if (unprocessed.length > 0) {
-                staleChecksAtBottom = 0; // reset bottom termination count
+                lastActivityTime = Date.now(); // reset idle timer because unprocessed tiles are present
                 const item = unprocessed[0]; // strictly process topmost unprocessed tile!
                 const mediaId = item.mediaId;
 
@@ -1480,10 +1499,18 @@
                 console.log(`[Auto-Upscaler] Success throttle — sleeping for ${sleepTime}ms...`);
                 await sleep(sleepTime);
 
+                lastActivityTime = Date.now(); // reset idle timer after download & throttle completes
                 continue; // Immediately re-evaluate getVisibleUnprocessedTiles()!
             }
 
-            // All visible tiles in current viewport processed! Now advance the viewport downwards.
+            // All visible tiles in current viewport processed!
+            const idleMs = Date.now() - lastActivityTime;
+            if (idleMs >= IDLE_COMPLETION_MS) {
+                console.log(`[Auto-Upscaler] No new images found in ${Math.round(idleMs / 1000)}s — finishing collection as complete.`);
+                break;
+            }
+
+            const remainingSec = Math.max(1, Math.ceil((IDLE_COMPLETION_MS - idleMs) / 1000));
             const currentTop = getScrollTop();
             const maxScroll = Math.max(0, getScrollHeight() - getClientHeight());
 
@@ -1491,27 +1518,28 @@
             const step = Math.min(Math.max(Math.floor(getClientHeight() * 0.45), 250), 380);
             const nextTop = Math.min(currentTop + step, maxScroll);
 
-            const didNotMove = Math.abs(currentTop - lastScrollTop) < 3 && currentTop === nextTop;
-            const reachedMax = currentTop >= maxScroll - 15;
+            const didNotMove = Math.abs(currentTop - lastScrollTop) < 3;
+            const reachedMax = currentTop >= maxScroll - 25;
 
             if (didNotMove || reachedMax) {
-                staleChecksAtBottom++;
-                console.log(`[Auto-Upscaler] End of collection check ${staleChecksAtBottom}/4 (currentTop: ${currentTop}, max: ${maxScroll}). Waiting for potential new tiles...`);
-                statusCard.textContent = `Downloaded: ${totalDownloaded} | Reached bottom. Verifying completion (${staleChecksAtBottom}/4)...`;
+                console.log(`[Auto-Upscaler] At bottom boundary (currentTop: ${currentTop}, max: ${maxScroll}). Checking for new tiles (${remainingSec}s remaining)...`);
+                statusCard.textContent = `Downloaded: ${totalDownloaded} | Reached bottom.\nChecking for new tiles (${remainingSec}s before completion)...`;
                 setScrollTop(maxScroll, 'auto');
-                await sleep(1000); // Give Angular virtual scroll / backend pagination time to load
+                await sleep(800);
             } else {
                 console.log(`[Auto-Upscaler] Advancing viewport from ${currentTop} to ${nextTop} (max: ${maxScroll})...`);
+                statusCard.textContent = `Downloaded: ${totalDownloaded} | Searching next rows (${remainingSec}s)...`;
                 setScrollTop(nextTop, 'auto');
                 lastScrollTop = currentTop;
-                await sleep(700); // Allow virtual scroll to hydrate newly revealed row
+                await sleep(650);
             }
         }
 
+        const wasUserStopped = window.__stop_auto_downloader;
         window.__is_auto_downloader_running = false;
         window.__stop_auto_downloader = false;
 
-        if (staleChecksAtBottom >= 4) {
+        if (!wasUserStopped) {
             // Finished entire collection cleanly!
             activeBtn.innerText = `Done! (${totalDownloaded} downloaded)`;
             activeBtn.style.backgroundColor = '#4CAF50';

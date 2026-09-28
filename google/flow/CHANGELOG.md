@@ -7,6 +7,17 @@ This document records the architectural decisions, reverse-engineering findings,
 
 ## Version History
 
+### v2.8.12 (2026-09-27) — 10s Idle Completion Safeguard & Occlusion Resilience
+- **Problems**:
+  1. *Stuck at the bottom without stopping*: If Angular's CDK virtual scroll container stopped slightly short of `maxScroll`, the strict scroll boundary equality check failed to trigger, keeping the continuous runner active even though no more images existed.
+  2. *Stopping when window is occluded / behind code editor*: When completely covered by an opaque window (e.g. code editor), macOS App Nap and Chromium Window Occlusion Tracking heavily throttle JavaScript timers and suspend CSS transitions, causing the 3.5s menu timeout to expire and trip the auto-stop safety latch.
+- **Solutions**:
+  - **10-Second Idle Completion Safeguard**: Added an activity timer (`lastActivityTime`). If no new unprocessed images are found for 10 seconds while scanning or at the bottom, the run cleanly and automatically terminates as successful (`✅ Collection complete! Total downloaded: X images.`).
+  - **Live Countdown on Status Card**: While checking the bottom or scanning, the status card displays a live second countdown (`Checking for new tiles (Xs before completion)...`).
+  - **Context Menu Dispatch Retry**: Added automatic retry for context menu event dispatching and extended overlay wait timeouts (to 4.5s for "Download" and 4.0s for "2K") to tolerate background occlusion lag.
+
+---
+
 ### v2.8.11 (2026-09-23) — Robust Collection End-Detection & Row-by-Row Continuous Downloader
 - **Problems**:
   1. *Hanging at the end*: The continuous auto-scroll downloader was unable to detect when the last image had been downloaded. It hung indefinitely at the bottom of the collection because the termination condition required `currentTop >= maxScroll - 5`, which is never satisfied in Angular CDK virtual scroll containers with bottom padding/buffer.
