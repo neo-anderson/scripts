@@ -7,6 +7,34 @@ This document records the architectural decisions, reverse-engineering findings,
 
 ## Version History
 
+### (2026-11-01) — Google Flow Downloads Validator & Automated Duplicate Triage (`validate_flow_downloads.py`)
+- **Context & Motivation**:
+  - Auto-scroll download runs can occasionally experience virtual scroll recycling or menu reuse issues where multiple IDs share the exact same 2K upscale image, or certain models (e.g. `imagen_4`) legitimately lack 2K upscaling.
+  - Needed an automated validation tool to inspect downloaded folders, verify 1K/2K completeness and sidecars, compute model stats, and safely triage duplicate image collisions.
+- **Features & Implementation**:
+  - **Pair & Sidecar Integrity**: Validates that both `GoogleFlow_1K_<id>.jpg` and `GoogleFlow_2K_<id>.jpg` exist with matching `.json` sidecars for every ID.
+  - **Model-Aware Completeness**: If 2K is missing, checks the model recorded in the sidecar. For `imagen_4` (which lacks 2K upscaling support), marks as valid/expected; otherwise flags an error.
+  - **Duplicate Content Treated as Failure**: Computes MD5 file hashes across all downloads. If distinct IDs share identical image bytes, treats the run as a failure.
+  - **Visual Difference Potential Original Detection**: Computes pixel-level Mean Absolute Error (MAE) between the duplicate 2K image and each candidate ID's 1K baseline image (rescaled RGB thumbnails). The candidate with lowest MAE is identified as the potential original.
+  - **Automated Triage & Cleanup**: Offers interactive (`[y/N]`) or headless (`--fix-duplicates`) resolution:
+    - Moves the potential original set (1K/2K images and sidecars) to a dedicated `duplicate_triage/` subfolder.
+    - Deletes false duplicate sets for the other IDs.
+    - If cleanup succeeds, reports `PASSED (with WARNING)` directing the user to the triage folder; if declined, reports `FAILED`.
+  - **Statistics Output**: Displays table of images and unique IDs per model, total image counts, and total file counts.
+
+---
+
+### (2026-10-31) — Low-Resolution 2K Cleanup Utility (`clean_lowres_2k.py`)
+- **Context & Motivation**:
+  - In earlier versions or unsupported models, triggering native download without 2K could download a 1K resolution image named with `2K`.
+  - Real 2K upscales are typically 2.0MB–3.5MB, while 1K images are ~500KB–700KB.
+- **Features & Implementation**:
+  - Scans for files containing `2K` (and not `1K`) with file size below a customizable threshold (default: `< 1.0 MB`).
+  - Safely deletes the low-resolution 2K image and its corresponding `.json` sidecar.
+  - Supports `--dry-run` and provides summary of deleted files and reclaimed disk space.
+
+---
+
 ### v2.8.12 (2026-09-27) — 10s Idle Completion Safeguard & Occlusion Resilience
 - **Problems**:
   1. *Stuck at the bottom without stopping*: If Angular's CDK virtual scroll container stopped slightly short of `maxScroll`, the strict scroll boundary equality check failed to trigger, keeping the continuous runner active even though no more images existed.
