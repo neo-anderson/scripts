@@ -55,9 +55,33 @@ Because the script drives native UI elements (Angular Material context menus) an
 
 ---
 
+## Helper Python Tools
+
+### 1. Download & Sidecar Validation Script (`validate_flow_downloads.py`)
+Validates exported files starting with `GoogleFlow_*` in a folder:
+- Verifies that both 1K and 2K files exist for each image ID.
+- Checks that `.json` sidecars exist for each `.jpg`/`.png`.
+- Handles models without 2K support: if a 2K file is missing, inspects the `.json` sidecar model tag. If `imagen_4`, marks it as valid/expected; otherwise flags an error.
+- Detects duplicate image content across different IDs (via MD5 hashes).
+- Prints a breakdown of images downloaded per model, total image counts, and total file counts.
+
+```bash
+python3 google/flow/validate_flow_downloads.py "/Users/aswin/Downloads/Brave Downloads"
+```
+
+### 2. Low-Resolution 2K Cleaner Script (`clean_lowres_2k.py`)
+Scans a folder for fake/low-resolution 2K downloads (< 1MB) and deletes both the 2K image and its corresponding `.json` sidecar without affecting 1K images:
+
+```bash
+python3 google/flow/clean_lowres_2k.py "/Users/aswin/Downloads/Brave Downloads" --threshold 1.0
+```
+
+---
+
 ## Installation
 
 1. Install the [Violentmonkey](https://violentmonkey.github.io/) browser extension.
 2. Install `flow-upscaler.user.js` into Violentmonkey.
 3. Navigate to [Google Flow](https://flow.google.com/) and open any project or collection.
 4. The floating control panel will appear in the top-right corner.
+
