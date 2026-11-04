@@ -30,6 +30,7 @@ Violentmonkey userscript for [Google Flow](https://flow.google.com/) that automa
 - **Selective Batch Downloading**: Select specific image tiles via checkboxes and click "Upscale / Download Selected".
 - **Humanized Throttling**: Randomized pauses (`offset + rand(1..3)s`) between operations and resolutions to prevent rate limiting.
 - **Fail-Safe Auto-Stop**: Halts immediately on failure to preserve quotas and logs the last successful download.
+- **"Moved to Trash" Toast Blocker**: Includes a toggle in the control panel to block and auto-dismiss the persistent `1 item moved to trash` snackbar toast notification that obscures tiles during deletion workflows.
 
 ---
 

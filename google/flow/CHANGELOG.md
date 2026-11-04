@@ -7,6 +7,17 @@ This document records the architectural decisions, reverse-engineering findings,
 
 ## Version History
 
+### v2.8.13 (2026-11-03) — "Moved to Trash" Toast Blocker Toggle
+- **Problem**:
+  - Whenever images or items are deleted or moved to trash in Google Flow, an Angular Material snackbar toast notification (`1 item moved to trash` with "Undo", "View in trash", and "Dismiss" buttons) pops up repeatedly at the bottom of the screen, obscuring tiles and UI elements for several seconds.
+- **Solution**:
+  - **Persistent Control Panel Toggle**: Added `Block "Moved to trash" toast` checkbox to the floating panel, saved in `localStorage` (`flow_block_trash_toast`), enabled by default.
+  - **Zero-Latency CSS Suppression**: Injected stylesheet rules targeting `.flow-blocked-snackbar` and parent overlay panes (`.cdk-overlay-pane`, `.cdk-global-overlay-wrapper`) to eliminate visual flashing.
+  - **Active MutationObserver & Auto-Dismiss**: Listens for newly inserted DOM nodes. When a snackbar containing `moved to trash` is detected, it hides the overlay pane and immediately clicks its "Dismiss" button so Angular's snackbar queue is cleanly released.
+  - **Periodic Cleanup**: Background interval actively dismisses any lingering trash snackbars across SPA navigation.
+
+---
+
 ### (2026-11-01) — Google Flow Downloads Validator & Automated Duplicate Triage (`validate_flow_downloads.py`)
 - **Context & Motivation**:
   - Auto-scroll download runs can occasionally experience virtual scroll recycling or menu reuse issues where multiple IDs share the exact same 2K upscale image, or certain models (e.g. `imagen_4`) legitimately lack 2K upscaling.

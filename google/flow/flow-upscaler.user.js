@@ -5,10 +5,13 @@
 // @match       https://flow.google.com/project/*
 // @match       https://labs.google/fx/tools/flow/project/*
 // @grant       none
-// @version     2.8.12
+// @version     2.8.13
 // ==/UserScript==
 
 // --- VERSION LOG ---
+// v2.8.13: "Moved to Trash" Toast Blocker Toggle
+//   - Added a persistent toggle in the floating control panel: 'Block "Moved to trash" toast' (enabled by default).
+//   - Uses a MutationObserver + CSS overlay suppression to instantly hide and auto-dismiss Angular Material trash snackbars.
 // v2.8.12: 10s Idle Completion Safeguard & Occlusion Resilience
 //   - Added 10-second idle completion safeguard: if no new unprocessed images appear in the DOM for 10 seconds, the runner finishes automatically and flags completion as successful.
 //   - Shows live countdown on the status card while searching/checking the collection boundary.
@@ -77,7 +80,7 @@
 (function() {
     'use strict';
 
-    const SCRIPT_VERSION = 'v2.8.12';
+    const SCRIPT_VERSION = 'v2.8.13';
 
     console.log(`[Auto-Upscaler ${SCRIPT_VERSION}] Script loaded on:`, window.location.href);
 
@@ -444,6 +447,33 @@
     dlDiv.appendChild(lbl1k);
     panelContent.appendChild(dlDiv);
 
+    // Toast notifications blocking
+    const toastDiv = document.createElement('div');
+    Object.assign(toastDiv.style, {
+        marginBottom: '10px',
+        paddingBottom: '10px',
+        borderBottom: '1px solid #444',
+    });
+
+    const lblBlockTrash = document.createElement('label');
+    Object.assign(lblBlockTrash.style, {
+        cursor: 'pointer',
+        display: 'flex',
+        alignItems: 'center',
+        gap: '5px',
+        fontSize: '11px',
+    });
+    const cbBlockTrash = document.createElement('input');
+    cbBlockTrash.type = 'checkbox';
+    cbBlockTrash.id = 'cb-block-trash-toast';
+    cbBlockTrash.checked = localStorage.getItem('flow_block_trash_toast') !== 'false';
+    cbBlockTrash.style.cursor = 'pointer';
+    cbBlockTrash.style.margin = '0';
+    lblBlockTrash.appendChild(cbBlockTrash);
+    lblBlockTrash.appendChild(document.createTextNode('Block "Moved to trash" toast'));
+    toastDiv.appendChild(lblBlockTrash);
+    panelContent.appendChild(toastDiv);
+
     // Default model
     const modelDiv = document.createElement('div');
     Object.assign(modelDiv.style, {
@@ -614,6 +644,84 @@
         defaultModelInp.disabled = !defaultModelCb.checked;
         modelInpRow.style.opacity = defaultModelCb.checked ? '1' : '0.4';
     });
+
+    // ---- TRASH TOAST NOTIFICATION BLOCKER ----
+    cbBlockTrash.addEventListener('change', () => {
+        localStorage.setItem('flow_block_trash_toast', cbBlockTrash.checked ? 'true' : 'false');
+        if (cbBlockTrash.checked) {
+            dismissTrashSnackbars();
+        }
+    });
+
+    function isBlockTrashToastEnabled() {
+        return cbBlockTrash.checked;
+    }
+
+    function processTrashSnackbar(node) {
+        if (!isBlockTrashToastEnabled() || !node || node.nodeType !== 1) return;
+
+        // Fast check if node or any descendant has snackbar label containing "moved to trash"
+        const isLabel = node.matches?.('[matsnackbarlabel], .mat-mdc-snack-bar-label, .mdc-snackbar__label');
+        const label = isLabel ? node : node.querySelector?.('[matsnackbarlabel], .mat-mdc-snack-bar-label, .mdc-snackbar__label');
+
+        if (label && /moved to trash/i.test(label.textContent || '')) {
+            const pane = label.closest('.cdk-overlay-pane') ||
+                         label.closest('mat-snack-bar-container') ||
+                         label.closest('.mdc-snackbar') ||
+                         node.closest('.cdk-overlay-pane');
+
+            if (pane) {
+                pane.classList.add('flow-blocked-snackbar');
+                pane.style.setProperty('display', 'none', 'important');
+                pane.style.setProperty('visibility', 'hidden', 'important');
+                pane.style.setProperty('pointer-events', 'none', 'important');
+                pane.style.setProperty('opacity', '0', 'important');
+            }
+
+            // Click "Dismiss" so Angular's snackbar service cleanly pops its queue
+            const dismissBtn = (pane || node).querySelector?.('button[matsnackbaraction]') ||
+                               Array.from((pane || node).querySelectorAll?.('button') || []).find(b => /dismiss/i.test(b.textContent || ''));
+            if (dismissBtn) {
+                try { dismissBtn.click(); } catch (e) {}
+            } else if (pane) {
+                try { pane.remove(); } catch (e) {}
+            }
+        }
+    }
+
+    function dismissTrashSnackbars() {
+        if (!isBlockTrashToastEnabled()) return;
+        const labels = document.querySelectorAll('[matsnackbarlabel], .mat-mdc-snack-bar-label, .mdc-snackbar__label');
+        for (const l of labels) {
+            processTrashSnackbar(l);
+        }
+    }
+
+    // Inject CSS to instantly suppress any flagged snackbar overlay pane without flicker
+    const toastBlockerStyle = document.createElement('style');
+    toastBlockerStyle.id = 'flow-toast-blocker-style';
+    toastBlockerStyle.textContent = `
+        .flow-blocked-snackbar,
+        .cdk-overlay-pane:has(.flow-blocked-snackbar),
+        .cdk-global-overlay-wrapper:has(.flow-blocked-snackbar) {
+            display: none !important;
+            opacity: 0 !important;
+            visibility: hidden !important;
+            pointer-events: none !important;
+        }
+    `;
+    (document.head || document.documentElement).appendChild(toastBlockerStyle);
+
+    // MutationObserver to catch snackbars as soon as Angular CDK appends them to DOM
+    const toastObserver = new MutationObserver((mutations) => {
+        if (!isBlockTrashToastEnabled()) return;
+        for (const m of mutations) {
+            for (const n of m.addedNodes) {
+                processTrashSnackbar(n);
+            }
+        }
+    });
+    toastObserver.observe(document.documentElement, { childList: true, subtree: true });
 
     // Mount floating panel safely across SPA navigation / React hydration
     function mountControlPanel() {
@@ -1869,6 +1977,7 @@
     setInterval(() => {
         mountControlPanel(); // keep panel mounted across SPA route changes & hydration
         updateStatusUI();   // keep auth and recaptcha indicators synchronized
+        dismissTrashSnackbars(); // auto-suppress trash toasts if enabled
 
         const selector = [
             'img[data-media-id]:not([data-upscaler-injected])',
