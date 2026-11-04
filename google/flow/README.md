@@ -63,11 +63,16 @@ Validates exported files starting with `GoogleFlow_*` in a folder:
 - Verifies that both 1K and 2K files exist for each image ID.
 - Checks that `.json` sidecars exist for each `.jpg`/`.png`.
 - Handles models without 2K support: if a 2K file is missing, inspects the `.json` sidecar model tag. If `imagen_4`, marks it as valid/expected; otherwise flags an error.
-- Detects duplicate image content across different IDs (via MD5 hashes).
+- Detects duplicate image content across different IDs (via MD5 hashes) and offers automated triage.
+- **Proper Pairs Isolation**: Prompts (or via `--move-proper` / `-m`) to move all complete, valid pairs and sidecars into a subfolder (`proper_pairs/`), cleanly leaving behind *only* the invalid or incomplete files in the main directory for easy inspection or re-download.
 - Prints a breakdown of images downloaded per model, total image counts, and total file counts.
 
 ```bash
+# Interactive check & prompt to isolate proper pairs:
 python3 google/flow/validate_flow_downloads.py "/Users/aswin/Downloads/Brave Downloads"
+
+# Automatically move proper pairs to 'proper_pairs/' subfolder:
+python3 google/flow/validate_flow_downloads.py "/Users/aswin/Downloads/Brave Downloads" --move-proper
 ```
 
 ### 2. Low-Resolution 2K Cleaner Script (`clean_lowres_2k.py`)

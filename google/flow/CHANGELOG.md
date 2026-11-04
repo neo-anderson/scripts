@@ -31,6 +31,7 @@ This document records the architectural decisions, reverse-engineering findings,
     - Moves the potential original set (1K/2K images and sidecars) to a dedicated `duplicate_triage/` subfolder.
     - Deletes false duplicate sets for the other IDs.
     - If cleanup succeeds, reports `PASSED (with WARNING)` directing the user to the triage folder; if declined, reports `FAILED`.
+  - **Proper Pairs Subfolder Isolation**: Prompts the user (or via `--move-proper` / `-m`) to move all complete, valid pairs and their sidecars into a subfolder (default: `proper_pairs/`). This cleanly isolates valid files and leaves only broken/incomplete files in the main directory for easy triage and reprocessing.
   - **Statistics Output**: Displays table of images and unique IDs per model, total image counts, and total file counts.
 
 ---

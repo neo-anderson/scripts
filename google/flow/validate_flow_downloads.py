@@ -16,7 +16,10 @@ Checks:
      and move that original set to a 'duplicate_triage/' subfolder.
    - If cleanup succeeds, prints PASSED with a warning pointing to the triage subfolder.
    - If rejected or if cleanup fails, prints FAILED.
-6. Outputs comprehensive statistics:
+6. Offers to move all proper complete pairs and sidecars to a dedicated subfolder
+   (e.g. 'proper_pairs/'), making it easy to isolate, inspect, and work with only
+   the invalid or incomplete files left behind.
+7. Outputs comprehensive statistics:
    - Images downloaded per model
    - Total number of images
    - Total number of sidecars and files
@@ -276,10 +279,108 @@ def triage_and_resolve_duplicates(
         return False
 
 
+def offer_and_move_proper_pairs(
+    valid_ids: list[tuple[str, str]],
+    items_by_id: dict[str, dict],
+    target_dir: Path,
+    subfolder_name: str = "proper_pairs",
+    auto_move: bool = False,
+    exclude_ids: set[str] | None = None,
+) -> tuple[int, int]:
+    """
+    Offers to move all complete, valid image pairs and their sidecars to a subfolder.
+    Excludes any IDs flagged in unresolved duplicate collisions or errors.
+    Returns (num_sets_moved, num_files_moved).
+    """
+    if exclude_ids is None:
+        exclude_ids = set()
+
+    # Collect valid files to move (only files physically in target_dir)
+    valid_files_to_move = []
+    eligible_ids = []
+
+    for mid, model in valid_ids:
+        if mid in exclude_ids:
+            continue
+        d = items_by_id.get(mid, {})
+        set_files = []
+        for k in ("1K", "1K_sidecar", "2K", "2K_sidecar"):
+            f = d.get(k)
+            if f and f.exists() and f.parent == target_dir and f not in valid_files_to_move:
+                set_files.append(f)
+        if set_files:
+            valid_files_to_move.extend(set_files)
+            eligible_ids.append(mid)
+
+    if not valid_files_to_move:
+        return 0, 0
+
+    num_sets = len(eligible_ids)
+    num_files = len(valid_files_to_move)
+
+    print("\n----------------------------------------------------------------------")
+    print(f" Proper Pairs & Sidecars ({num_sets} valid sets, {num_files} files)")
+    print("----------------------------------------------------------------------")
+    print(f"Moving these out isolates only the invalid, incomplete, or broken files in:")
+    print(f"  {target_dir}")
+
+    do_move = False
+    if auto_move:
+        print(f"\n--move-proper flag provided. Moving valid sets to '{subfolder_name}/' automatically.")
+        do_move = True
+    elif sys.stdin.isatty():
+        try:
+            resp = input(
+                f"\nDo you want to move all proper pairs and sidecars to '{subfolder_name}/'? [y/N]: "
+            ).strip().lower()
+            do_move = (resp in ("y", "yes"))
+        except (KeyboardInterrupt, EOFError):
+            print("\nSkipped moving proper pairs.")
+            return 0, 0
+    else:
+        print(f"\nNon-interactive session. Use --move-proper to automatically move valid sets to '{subfolder_name}/'.")
+        return 0, 0
+
+    if not do_move:
+        print("Skipped. Proper pairs will remain in the current directory.")
+        return 0, 0
+
+    dest_dir = target_dir / subfolder_name
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    moved_count = 0
+    for f in valid_files_to_move:
+        try:
+            dest_file = dest_dir / f.name
+            shutil.move(str(f), str(dest_file))
+            moved_count += 1
+        except Exception as e:
+            print(f"  Error moving {f.name}: {e}", file=sys.stderr)
+
+    print(f"\n✓ Successfully moved {num_sets} proper sets ({moved_count} files) to:\n  {dest_dir}")
+
+    # Count remaining GoogleFlow files in target_dir
+    remaining_files = [
+        p for p in target_dir.iterdir()
+        if p.is_file() and p.name.startswith("GoogleFlow")
+    ]
+    if remaining_files:
+        print(f"\nRemaining files in main directory ({len(remaining_files)} files):")
+        for p in sorted(remaining_files):
+            print(f"  • {p.name}")
+        print("👉 These are the invalid / incomplete files to investigate or retry.")
+    else:
+        print("\nAll files were proper pairs; main directory is now clean!")
+
+    return num_sets, moved_count
+
+
 def validate_directory(
     target_dir: Path,
     check_duplicates: bool = True,
     auto_fix_duplicates: bool = False,
+    auto_move_proper: bool = False,
+    proper_subfolder: str = "proper_pairs",
 ) -> int:
     target_path = Path(target_dir).expanduser().resolve()
     if not target_path.exists() or not target_path.is_dir():
@@ -463,8 +564,15 @@ def validate_directory(
         for path, mid, reason in error_missing_sidecar:
             print(f"  • {reason}: {path.name} (ID: {mid})")
 
-    # Duplicate Hash Detection - Classified as Failure
-    duplicate_groups = {h: flist for h, flist in hash_to_images.items() if len(flist) > 1}
+    # Duplicate Hash Detection - Classified as Failure (only across distinct IDs)
+    duplicate_groups = {}
+    for h, flist in hash_to_images.items():
+        if len(flist) > 1:
+            group_ids = {
+                m.group("id") for f in flist if (m := IMAGE_PATTERN.match(f.name))
+            }
+            if len(group_ids) > 1:
+                duplicate_groups[h] = flist
     duplicates_present = bool(duplicate_groups)
     duplicates_triaged_cleanly = False
 
@@ -485,13 +593,45 @@ def validate_directory(
             auto_fix=auto_fix_duplicates,
         )
 
+    # Offer to move proper pairs & sidecars to a subfolder
+    proper_moved_sets, proper_moved_files = 0, 0
+    valid_ids_all = valid_complete + valid_imagen4_1k_only
+
+    # Exclude any IDs involved in unresolved duplicate collisions
+    unresolved_duplicate_ids = set()
+    if duplicates_present and not duplicates_triaged_cleanly:
+        for file_list in duplicate_groups.values():
+            for f in file_list:
+                m = IMAGE_PATTERN.match(f.name)
+                if m:
+                    unresolved_duplicate_ids.add(m.group("id"))
+
+    if valid_ids_all:
+        proper_moved_sets, proper_moved_files = offer_and_move_proper_pairs(
+            valid_ids=valid_ids_all,
+            items_by_id=items_by_id,
+            target_dir=target_path,
+            subfolder_name=proper_subfolder,
+            auto_move=auto_move_proper,
+            exclude_ids=unresolved_duplicate_ids,
+        )
+
     print("\n" + "=" * 70)
+    if proper_moved_files > 0:
+        print(f" [INFO] Moved {proper_moved_sets} proper pairs ({proper_moved_files} files) to: {proper_subfolder}/")
+
     if has_standard_errors:
         print(" RESULT: FAILED (Discrepancies found in file pairs or sidecars)")
+        if proper_moved_files > 0:
+            print(f" NOTE: Proper pairs were moved. Only invalid/incomplete files remain in:")
+            print(f"       {target_path}")
         print("=" * 70)
         return 1
     elif duplicates_present and not duplicates_triaged_cleanly:
         print(" RESULT: FAILED (Duplicate image content detected under multiple IDs)")
+        if proper_moved_files > 0:
+            print(f" NOTE: Proper pairs were moved. Only invalid/duplicate files remain in:")
+            print(f"       {target_path}")
         print("=" * 70)
         return 1
     elif duplicates_present and duplicates_triaged_cleanly:
@@ -529,6 +669,17 @@ def main():
         action="store_true",
         help="Automatically remove false duplicate sets and move potential original to duplicate_triage/ without prompting",
     )
+    parser.add_argument(
+        "--move-proper",
+        "-m",
+        action="store_true",
+        help="Automatically move proper pairs and sidecars to subfolder without prompting",
+    )
+    parser.add_argument(
+        "--proper-subfolder",
+        default="proper_pairs",
+        help="Subfolder name to move proper pairs into (default: 'proper_pairs')",
+    )
     args = parser.parse_args()
 
     target_dir = Path(args.directory)
@@ -536,6 +687,8 @@ def main():
         target_dir,
         check_duplicates=not args.no_hash_check,
         auto_fix_duplicates=args.fix_duplicates,
+        auto_move_proper=args.move_proper,
+        proper_subfolder=args.proper_subfolder,
     )
     sys.exit(code)
 
