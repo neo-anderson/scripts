@@ -170,9 +170,13 @@ def plan_renames(
     uuid_map: dict[str, dict],
     ambiguous_short_ids: dict[str, list[str]],
     allow_overwrite: bool = False,
+    allow_derived_sidecars: bool = False,
 ) -> tuple[list[dict], list[Path], list[dict]]:
     """
     Plans renames for files in images_dir and detects all conflicts.
+    Enforces strict 1:1 resolution matching by default:
+      - 1K images strictly require 1K sidecars
+      - 2K images strictly require 2K sidecars
     Returns:
       (plans, unmapped_files, conflicts)
     """
@@ -192,63 +196,72 @@ def plan_renames(
         if name.startswith("GoogleFlow_"):
             continue
 
-        # Check 2K pattern first
+        res = None
+        short_id = None
+        ext = None
+        slug = None
+
         m2k = NATIVE_2K_PATTERN.match(name)
         if m2k:
+            res = "2K"
             short_id = m2k.group("short_id").lower()
             ext = m2k.group("ext").lower()
-            if short_id in ambiguous_short_ids:
-                conflicts.append({
-                    "type": "ambiguous_id",
-                    "source": p,
-                    "target": None,
-                    "short_id": short_id,
-                    "details": f"Short ID matches multiple UUIDs in sidecars: {', '.join(ambiguous_short_ids[short_id])}",
-                })
-            elif short_id in uuid_map:
-                full_uuid = uuid_map[short_id]["full_uuid"]
-                target_name = f"GoogleFlow_2K_{full_uuid}.{ext}"
-                target_path = images_dir / target_name
-                raw_candidates.append({
-                    "source": p,
-                    "target": target_path,
-                    "res": "2K",
-                    "short_id": short_id,
-                    "full_uuid": full_uuid,
-                    "slug": m2k.group("slug"),
-                })
-            else:
-                unmapped.append(p)
+            slug = m2k.group("slug")
+        else:
+            m1k = NATIVE_1K_PATTERN.match(name)
+            if m1k:
+                res = "1K"
+                short_id = m1k.group("short_id").lower()
+                ext = m1k.group("ext").lower()
+                slug = m1k.group("slug")
+
+        if not res:
             continue
 
-        # Check 1K pattern
-        m1k = NATIVE_1K_PATTERN.match(name)
-        if m1k:
-            short_id = m1k.group("short_id").lower()
-            ext = m1k.group("ext").lower()
-            if short_id in ambiguous_short_ids:
-                conflicts.append({
-                    "type": "ambiguous_id",
-                    "source": p,
-                    "target": None,
-                    "short_id": short_id,
-                    "details": f"Short ID matches multiple UUIDs in sidecars: {', '.join(ambiguous_short_ids[short_id])}",
-                })
-            elif short_id in uuid_map:
-                full_uuid = uuid_map[short_id]["full_uuid"]
-                target_name = f"GoogleFlow_1K_{full_uuid}.{ext}"
-                target_path = images_dir / target_name
-                raw_candidates.append({
-                    "source": p,
-                    "target": target_path,
-                    "res": "1K",
-                    "short_id": short_id,
-                    "full_uuid": full_uuid,
-                    "slug": m1k.group("slug"),
-                })
-            else:
-                unmapped.append(p)
+        # 1. Check for ambiguous short ID collisions
+        if short_id in ambiguous_short_ids:
+            conflicts.append({
+                "type": "ambiguous_id",
+                "source": p,
+                "target": None,
+                "short_id": short_id,
+                "details": f"Short ID matches multiple UUIDs in sidecars: {', '.join(ambiguous_short_ids[short_id])}",
+            })
             continue
+
+        # 2. Check if short ID exists in uuid_map
+        if short_id not in uuid_map:
+            unmapped.append(p)
+            continue
+
+        info = uuid_map[short_id]
+        full_uuid = info["full_uuid"]
+        target_name = f"GoogleFlow_{res}_{full_uuid}.{ext}"
+        target_path = images_dir / target_name
+
+        # 3. Check sidecar availability for this exact resolution
+        sc_path, sc_status = resolve_sidecar_for_resolution(
+            res, info, allow_derived=allow_derived_sidecars
+        )
+        if not sc_path:
+            conflicts.append({
+                "type": "missing_sidecar",
+                "source": p,
+                "target": target_path,
+                "short_id": short_id,
+                "details": f"Missing exact {res} sidecar ({sc_status}). Pass --allow-derived-sidecars to cross-derive.",
+            })
+            continue
+
+        raw_candidates.append({
+            "source": p,
+            "target": target_path,
+            "res": res,
+            "short_id": short_id,
+            "full_uuid": full_uuid,
+            "slug": slug,
+            "sidecar_status": sc_status,
+        })
 
     # Cross-check for collisions (multiple sources targeting the same filename)
     target_groups = defaultdict(list)
@@ -258,7 +271,6 @@ def plan_renames(
     plans = []
     for target_path, group in target_groups.items():
         if len(group) > 1:
-            # Multiple sources mapping to the exact same target filename
             source_names = [item["source"].name for item in group]
             for item in group:
                 conflicts.append({
@@ -301,11 +313,12 @@ def plan_renames(
     return plans, unmapped, conflicts
 
 
-def resolve_sidecar_for_resolution(res: str, sidecar_info: dict) -> tuple[Path | None, str]:
+def resolve_sidecar_for_resolution(
+    res: str, sidecar_info: dict, allow_derived: bool = False
+) -> tuple[Path | None, str]:
     """
-    Finds the best sidecar JSON file for the given resolution ("1K" or "2K").
-    Returns (source_path, status_description).
-    Status description explains if it is an exact resolution match or derived.
+    Finds the sidecar JSON file matching the image's resolution ("1K" or "2K").
+    If allow_derived is False (default), only exact resolution matches are accepted.
     """
     exact_key = f"sidecar_{res.lower()}"
     exact_sc = sidecar_info.get(exact_key)
@@ -313,22 +326,31 @@ def resolve_sidecar_for_resolution(res: str, sidecar_info: dict) -> tuple[Path |
         if inspect_json_resolution(exact_sc) == res:
             return exact_sc, f"exact {res} sidecar match ({exact_sc.name})"
 
-    # If exact resolution sidecar not found, check the alternate resolution to derive from
+    # If exact resolution sidecar not found, check alternate resolution
     alt_res = "1K" if res == "2K" else "2K"
     alt_sc = sidecar_info.get(f"sidecar_{alt_res.lower()}")
     if alt_sc and alt_sc.exists():
-        return alt_sc, f"derived from {alt_res} sidecar ({alt_sc.name}) with tags updated to {res}"
+        if allow_derived:
+            return alt_sc, f"derived from {alt_res} sidecar ({alt_sc.name}) with tags updated to {res}"
+        else:
+            return None, f"only {alt_res} sidecar exists: {alt_sc.name}"
 
-    # Fallback to generic sidecar if present
     gen_sc = sidecar_info.get("generic_sidecar")
     if gen_sc and gen_sc.exists():
-        return gen_sc, f"derived from generic sidecar ({gen_sc.name}) with tags updated to {res}"
+        if allow_derived:
+            return gen_sc, f"derived from generic sidecar ({gen_sc.name}) with tags updated to {res}"
+        else:
+            return None, f"only generic sidecar exists: {gen_sc.name}"
 
-    return None, "no sidecar found"
+    return None, f"no {res} sidecar found"
 
 
 def copy_or_create_sidecar(
-    plan: dict, sidecar_info: dict, target_dir: Path, dry_run: bool = False
+    plan: dict,
+    sidecar_info: dict,
+    target_dir: Path,
+    dry_run: bool = False,
+    allow_derived: bool = False,
 ) -> tuple[Path | None, str]:
     """
     Copies or creates matching sidecar JSON for the renamed file, ensuring
@@ -338,7 +360,9 @@ def copy_or_create_sidecar(
     target_img = plan["target"]
     target_sidecar = target_dir / f"{target_img.name}.json"
 
-    sc_source, desc = resolve_sidecar_for_resolution(res, sidecar_info)
+    sc_source, desc = resolve_sidecar_for_resolution(
+        res, sidecar_info, allow_derived=allow_derived
+    )
     if not sc_source or not sc_source.exists():
         return None, desc
 
@@ -424,6 +448,11 @@ def main():
         help="Allow overwriting destination files that already exist on disk.",
     )
     parser.add_argument(
+        "--allow-derived-sidecars",
+        action="store_true",
+        help="Allow deriving missing resolution sidecars from the opposite resolution (e.g. 1K from 2K, or 2K from 1K).",
+    )
+    parser.add_argument(
         "--copy-sidecars",
         action="store_true",
         default=True,
@@ -506,6 +535,7 @@ def main():
         uuid_map,
         ambiguous_short_ids,
         allow_overwrite=args.overwrite,
+        allow_derived_sidecars=args.allow_derived_sidecars,
     )
 
     # 1. Report planned safe renames
@@ -514,7 +544,9 @@ def main():
         print("-" * 70)
         for p in plans:
             info = uuid_map.get(p["short_id"], {})
-            _, sc_status = resolve_sidecar_for_resolution(p["res"], info)
+            _, sc_status = resolve_sidecar_for_resolution(
+                p["res"], info, allow_derived=args.allow_derived_sidecars
+            )
             overwrite_warn = " ⚠️ [OVERWRITE]" if p.get("will_overwrite") else ""
             print(f"  [{p['res']}] {p['source'].name}")
             print(f"    ↳ New Image:   {p['target'].name}{overwrite_warn}")
@@ -532,6 +564,10 @@ def main():
             tgt_name = c["target"].name if c.get("target") else "N/A"
             if ctype == "destination_exists":
                 print(f"  [DESTINATION ALREADY EXISTS] {src_name}")
+                print(f"    ↳ Target:  {tgt_name}")
+                print(f"    ↳ Reason:  {c['details']}")
+            elif ctype == "missing_sidecar":
+                print(f"  [MISSING EXACT RESOLUTION SIDECAR] {src_name}")
                 print(f"    ↳ Target:  {tgt_name}")
                 print(f"    ↳ Reason:  {c['details']}")
             elif ctype == "multiple_sources":
@@ -597,7 +633,13 @@ def main():
 
             if args.copy_sidecars:
                 info = uuid_map.get(p["short_id"], {})
-                sc, _ = copy_or_create_sidecar(p, info, images_dir, dry_run=False)
+                sc, _ = copy_or_create_sidecar(
+                    p,
+                    info,
+                    images_dir,
+                    dry_run=False,
+                    allow_derived=args.allow_derived_sidecars,
+                )
                 if sc:
                     sidecars_created += 1
         except Exception as e:
