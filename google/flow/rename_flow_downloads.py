@@ -310,12 +310,19 @@ def main():
         "directory",
         nargs="?",
         default=".",
-        help="Base directory containing sidecars, or directory containing download/ subfolder.",
+        help="Directory containing images to rename (defaults to current directory).",
     )
     parser.add_argument(
+        "--metadata-dir",
+        "-m",
+        default=None,
+        help="Subfolder containing sidecar JSON files (defaults to <directory>/metadata if present, else auto-detects meta/, sidecars/, or <directory>).",
+    )
+    parser.add_argument(
+        "--images-dir",
         "--download-dir",
         default=None,
-        help="Explicit subfolder containing native image downloads (defaults to <directory>/download if present, else <directory>).",
+        help="Explicit directory containing images to rename (defaults to <directory>).",
     )
     parser.add_argument(
         "--dry-run",
@@ -353,23 +360,44 @@ def main():
         print(f"Error: Directory not found: {base_dir}", file=sys.stderr)
         return 1
 
-    # Determine images folder
-    if args.download_dir:
-        images_dir = Path(args.download_dir).expanduser().resolve()
-    elif (base_dir / "download").exists() and (base_dir / "download").is_dir():
-        images_dir = base_dir / "download"
+    # Determine metadata directory (subfolder priority: metadata/ -> meta/ -> sidecars/ -> base_dir)
+    if args.metadata_dir:
+        metadata_dir = Path(args.metadata_dir).expanduser().resolve()
     else:
-        images_dir = base_dir
+        candidates = ["metadata", "meta", "sidecars"]
+        found_meta_subfolder = None
+        for c in candidates:
+            cand_path = base_dir / c
+            if cand_path.exists() and cand_path.is_dir():
+                found_meta_subfolder = cand_path
+                break
+        metadata_dir = found_meta_subfolder if found_meta_subfolder else base_dir
+
+    # Determine images directory (default is base_dir; fallback to download/ if base_dir has no native images)
+    if args.images_dir:
+        images_dir = Path(args.images_dir).expanduser().resolve()
+    else:
+        has_native_in_base = any(
+            NATIVE_2K_PATTERN.match(p.name) or NATIVE_1K_PATTERN.match(p.name)
+            for p in base_dir.iterdir()
+            if p.is_file()
+        )
+        if not has_native_in_base and (base_dir / "download").exists() and (base_dir / "download").is_dir():
+            images_dir = base_dir / "download"
+        else:
+            images_dir = base_dir
 
     print("=" * 70)
     print(" Google Flow Native Downloads Renamer")
     print("=" * 70)
-    print(f"Base Directory:   {base_dir}")
-    print(f"Images Directory: {images_dir}")
+    print(f"Images Directory:   {images_dir}")
+    print(f"Metadata Directory: {metadata_dir}")
 
-    # Build UUID map by looking in base_dir and images_dir
-    search_dirs = [base_dir]
-    if images_dir != base_dir:
+    # Build UUID map by looking in metadata_dir and base_dir
+    search_dirs = [metadata_dir]
+    if base_dir != metadata_dir:
+        search_dirs.append(base_dir)
+    if images_dir not in search_dirs:
         search_dirs.append(images_dir)
     if args.search_parent and base_dir.parent.exists():
         search_dirs.append(base_dir.parent)
