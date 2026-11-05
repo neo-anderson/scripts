@@ -5,10 +5,15 @@
 // @match       https://flow.google.com/project/*
 // @match       https://labs.google/fx/tools/flow/project/*
 // @grant       none
-// @version     2.8.14
+// @version     2.8.15
 // ==/UserScript==
 
 // --- VERSION LOG ---
+// v2.8.15: Unique Source Images Download & Zero-Delay Metadata/Source Export
+//   - Added 'Download unique sources' option in the control panel to automatically download original ingredient/source images (named GoogleFlow_Source_<UUID>.jpg).
+//   - Deduplicates sources in-memory across the session so each unique source image is downloaded only once.
+//   - Removed artificial sleep delays between metadata sidecar saves and source image downloads for instantaneous, rapid export.
+//   - Supports running sources-only, metadata-only, or combined with 1K/2K downloads.
 // v2.8.14: Source Image ID Extraction & Metadata Only Mode
 //   - Extracts source/ingredient image UUIDs from .ingredients-list / flow-ingredient-chip and includes "3.Source: <id1>, <id2>..." in the JSON sidecar notes.
 //   - Added 'Metadata only (save JSON sidecars only)' mode to export .json sidecars for selected or continuous images without downloading binary image files.
@@ -449,6 +454,24 @@
     lbl1k.appendChild(document.createTextNode('Download default 1K'));
     dlDiv.appendChild(lbl1k);
 
+    const lblSources = document.createElement('label');
+    Object.assign(lblSources.style, {
+        cursor: 'pointer',
+        display: 'flex',
+        alignItems: 'center',
+        gap: '5px',
+        fontSize: '11px',
+    });
+    const cbDownloadSources = document.createElement('input');
+    cbDownloadSources.type = 'checkbox';
+    cbDownloadSources.id = 'cb-download-sources';
+    cbDownloadSources.checked = localStorage.getItem('flow_download_sources') === 'true';
+    cbDownloadSources.style.cursor = 'pointer';
+    cbDownloadSources.style.margin = '0';
+    lblSources.appendChild(cbDownloadSources);
+    lblSources.appendChild(document.createTextNode('Download unique sources'));
+    dlDiv.appendChild(lblSources);
+
     const lblMetaOnly = document.createElement('label');
     Object.assign(lblMetaOnly.style, {
         cursor: 'pointer',
@@ -669,16 +692,40 @@
         modelInpRow.style.opacity = defaultModelCb.checked ? '1' : '0.4';
     });
 
-    // ---- Update action button labels when metadata-only mode changes ----
+    // ---- Update action button labels when download/metadata mode changes ----
     const updateButtonLabels = () => {
         const isMeta = cbMetaOnly.checked;
+        const do2k = cbDownload2k.checked;
+        const do1k = cbDownload1k.checked;
+        const doSrc = cbDownloadSources.checked;
         if (!window.__is_auto_downloader_running) {
-            btnUpscale.textContent = isMeta ? 'Save Metadata (Selected)' : 'Upscale / Download Selected';
-            btnDownloadCollection.textContent = isMeta ? 'Auto Scroll & Save Metadata' : 'Auto Scroll & Download Collection';
+            if (isMeta && doSrc && !do2k && !do1k) {
+                btnUpscale.textContent = 'Save Meta & Sources (Selected)';
+                btnDownloadCollection.textContent = 'Auto Scroll & Save Meta/Sources';
+            } else if (isMeta) {
+                btnUpscale.textContent = 'Save Metadata (Selected)';
+                btnDownloadCollection.textContent = 'Auto Scroll & Save Metadata';
+            } else if (doSrc && !do2k && !do1k) {
+                btnUpscale.textContent = 'Download Sources (Selected)';
+                btnDownloadCollection.textContent = 'Auto Scroll & Download Sources';
+            } else {
+                btnUpscale.textContent = 'Upscale / Download Selected';
+                btnDownloadCollection.textContent = 'Auto Scroll & Download Collection';
+            }
         }
     };
     cbMetaOnly.addEventListener('change', () => {
         localStorage.setItem('flow_metadata_only', cbMetaOnly.checked ? 'true' : 'false');
+        updateButtonLabels();
+    });
+    cbDownloadSources.addEventListener('change', () => {
+        localStorage.setItem('flow_download_sources', cbDownloadSources.checked ? 'true' : 'false');
+        updateButtonLabels();
+    });
+    cbDownload1k.addEventListener('change', () => {
+        updateButtonLabels();
+    });
+    cbDownload2k.addEventListener('change', () => {
         updateButtonLabels();
     });
     updateButtonLabels();
@@ -919,7 +966,9 @@
 
         // 3. Source / Ingredient Images extraction
         const sourceIds = [];
-        const ingredientImgs = Array.from(row.querySelectorAll('.ingredients-list img, flow-ingredient-chip img, flow-image-ingredient-chip img, [class*="ingredient"] img'));
+        const sourceItems = [];
+        const batchRoot = img.closest('.batch-container, flow-generation-row, .virtual-item-container, [data-item-index]') || row;
+        const ingredientImgs = Array.from(batchRoot.querySelectorAll('.ingredients-list img, flow-ingredient-chip img, flow-image-ingredient-chip img, [class*="ingredient"] img'));
         for (const ingImg of ingredientImgs) {
             const src = ingImg.src || ingImg.getAttribute('src') || '';
             const match = src.match(/\/image\/([0-9a-fA-F-]{36})/i) ||
@@ -930,10 +979,12 @@
                 const sid = match[1];
                 if (!sourceIds.includes(sid)) {
                     sourceIds.push(sid);
+                    sourceItems.push({ id: sid, url: src });
                 }
             }
         }
         meta.sources = sourceIds;
+        meta.sourceItems = sourceItems;
 
         return meta;
     }
@@ -1418,19 +1469,45 @@
         setTimeout(() => window.URL.revokeObjectURL(blobUrl), 10000);
     };
 
-    // Writes image-filename.ext.json sidecar using either cached metadata or DOM extraction
+    // Writes image-filename.ext.json sidecar using either cached metadata or DOM extraction (instant, zero-sleep)
     const writeSidecar = async (mediaId, imageFilename, upscaled, cachedMeta) => {
         const meta = (cachedMeta && cachedMeta.prompt) ? cachedMeta : getImageMetadata(mediaId);
-        await sleep(400); // avoid the browser's multi-download block
         downloadText(buildJson(meta, upscaled), `${imageFilename}.json`);
     };
+
+    // Deduplicated source images cache (tracked across session)
+    const downloadedSourceIds = new Set();
+
+    async function downloadUniqueSources(meta) {
+        if (!meta || !meta.sourceItems || meta.sourceItems.length === 0) return 0;
+        let count = 0;
+        for (const item of meta.sourceItems) {
+            if (!item.id || !item.url) continue;
+            if (downloadedSourceIds.has(item.id)) {
+                console.log(`[Auto-Upscaler] Source image ${item.id} already downloaded in session, skipping.`);
+                continue;
+            }
+            downloadedSourceIds.add(item.id);
+            const filename = `GoogleFlow_Source_${item.id}.jpg`;
+            console.log(`[Auto-Upscaler] Downloading unique source: ${filename}`);
+            try {
+                await downloadUrl(item.url, filename);
+                count++;
+            } catch (e) {
+                console.error(`[Auto-Upscaler] Error downloading source ${item.id}:`, e);
+            }
+            // Zero sleep between source downloads
+        }
+        return count;
+    }
 
     async function runContinuousCollectionDownloader(activeBtn) {
         const do2k = cbDownload2k.checked;
         const do1k = cbDownload1k.checked;
+        const doSources = cbDownloadSources.checked;
         const isMetadataOnly = cbMetaOnly.checked;
-        if (!do2k && !do1k) {
-            alert("Please enable at least one resolution option (2K Upscaled or Default 1K).");
+        if (!do2k && !do1k && !doSources) {
+            alert("Please enable at least one resolution or download option (2K Upscaled, Default 1K, or Sources).");
             return;
         }
 
@@ -1442,7 +1519,9 @@
             return;
         }
 
-        const originalBtnText = isMetadataOnly ? 'Auto Scroll & Save Metadata' : 'Auto Scroll & Download Collection';
+        const originalBtnText = isMetadataOnly
+            ? (doSources && !do2k && !do1k ? 'Auto Scroll & Save Meta/Sources' : 'Auto Scroll & Save Metadata')
+            : (doSources && !do2k && !do1k ? 'Auto Scroll & Download Sources' : 'Auto Scroll & Download Collection');
         const originalBtnColor = '#4CAF50';
 
         window.__is_auto_downloader_running = true;
@@ -1555,24 +1634,58 @@
                     : `Downloaded: ${totalDownloaded - 1} images so far\nCurrently processing: ${mediaId.slice(0, 8)}...`;
                 console.log(`[Auto-Upscaler] Continuous ${isMetadataOnly ? 'Metadata' : 'Download'} #${totalDownloaded}: ${mediaId}`);
 
-                // In Metadata-Only Mode, bypass image downloads and write sidecars directly
+                // In Metadata-Only Mode, bypass image downloads and write sidecars directly (zero sleep)
                 if (isMetadataOnly) {
                     const meta = getImageMetadata(mediaId);
                     if (do2k) {
                         await writeSidecar(mediaId, `GoogleFlow_2K_${mediaId}.jpg`, true, meta);
                     }
                     if (do1k) {
-                        if (do2k) await sleep(200);
                         await writeSidecar(mediaId, `GoogleFlow_1K_${mediaId}.jpg`, false, meta);
+                    }
+                    if (doSources) {
+                        await downloadUniqueSources(meta);
                     }
                     lastSuccessfulDownload = {
                         mediaId: mediaId,
                         filename: `GoogleFlow_metadata_${mediaId}.json`,
                         time: new Date().toLocaleTimeString()
                     };
-                    const offsetMs = computeWaitMs(getSuccessOffset(), 0.2, 0.5);
-                    await sleep(offsetMs);
+                    const cb = document.querySelector(`.upscaler-checkbox[value="${mediaId}"]`);
+                    const targetOverlay = (cb && cb.parentElement) || item.tile?.querySelector('.upscaler-tile-overlay');
+                    if (targetOverlay) targetOverlay.style.backgroundColor = 'rgba(76, 175, 80, 0.8)';
+                    if (cb) {
+                        cb.checked = false;
+                        updateSelectedCount();
+                    }
+                    // Instant, zero sleep between metadata and source downloads
                     continue;
+                }
+
+                // If ONLY Sources mode is selected (neither 2K nor 1K checked)
+                if (!do2k && !do1k && doSources) {
+                    const meta = getImageMetadata(mediaId);
+                    await downloadUniqueSources(meta);
+                    lastSuccessfulDownload = {
+                        mediaId: mediaId,
+                        filename: `GoogleFlow_sources_${mediaId}`,
+                        time: new Date().toLocaleTimeString()
+                    };
+                    const cb = document.querySelector(`.upscaler-checkbox[value="${mediaId}"]`);
+                    const targetOverlay = (cb && cb.parentElement) || item.tile?.querySelector('.upscaler-tile-overlay');
+                    if (targetOverlay) targetOverlay.style.backgroundColor = 'rgba(76, 175, 80, 0.8)';
+                    if (cb) {
+                        cb.checked = false;
+                        updateSelectedCount();
+                    }
+                    // Instant, zero sleep between source downloads
+                    continue;
+                }
+
+                // If sources requested alongside image downloads, fetch unique sources first without sleep
+                if (doSources) {
+                    const meta = getImageMetadata(mediaId);
+                    await downloadUniqueSources(meta);
                 }
 
                 let success2k = false;
@@ -1763,10 +1876,11 @@
 
         const do2k = cbDownload2k.checked;
         const do1k = cbDownload1k.checked;
+        const doSources = cbDownloadSources.checked;
         const isMetadataOnly = cbMetaOnly.checked;
 
-        if (!do2k && !do1k) {
-            alert("Please enable at least one resolution option (2K Upscaled or Default 1K).");
+        if (!do2k && !do1k && !doSources) {
+            alert("Please enable at least one resolution or download option (2K Upscaled, Default 1K, or Sources).");
             return;
         }
 
@@ -1779,8 +1893,8 @@
         }
 
         const originalBtnText = isMetadataOnly
-            ? ((activeBtn === btnDownloadCollection) ? 'Auto Scroll & Save Metadata' : 'Save Metadata (Selected)')
-            : ((activeBtn === btnDownloadCollection) ? 'Auto Scroll & Download Collection' : 'Upscale / Download Selected');
+            ? (doSources && !do2k && !do1k ? ((activeBtn === btnDownloadCollection) ? 'Auto Scroll & Save Meta/Sources' : 'Save Meta & Sources (Selected)') : ((activeBtn === btnDownloadCollection) ? 'Auto Scroll & Save Metadata' : 'Save Metadata (Selected)'))
+            : (doSources && !do2k && !do1k ? ((activeBtn === btnDownloadCollection) ? 'Auto Scroll & Download Sources' : 'Download Sources (Selected)') : ((activeBtn === btnDownloadCollection) ? 'Auto Scroll & Download Collection' : 'Upscale / Download Selected'));
         const originalBtnColor = (activeBtn === btnDownloadCollection) ? '#4CAF50' : '#2196F3';
 
         activeBtn.innerText = `Processing 0 / ${itemsList.length}...`;
@@ -1842,10 +1956,13 @@
                     savedAny = true;
                 }
                 if (do1k) {
-                    if (do2k) await sleep(200);
                     await writeSidecar(mediaId, `GoogleFlow_1K_${mediaId}.jpg`, false, meta);
                     console.log(`[Auto-Upscaler] Wrote 1K metadata sidecar for ${mediaId}`);
                     savedAny = true;
+                }
+                if (doSources) {
+                    const srcCount = await downloadUniqueSources(meta);
+                    if (srcCount > 0) savedAny = true;
                 }
                 if (savedAny) {
                     if (cb) cb.checked = false;
@@ -1856,9 +1973,27 @@
                     };
                     updateSelectedCount();
                 }
-                const offsetMs = computeWaitMs(getSuccessOffset(), 0.1, 0.3);
-                await sleep(offsetMs);
+                // Instant, zero sleep between metadata or source downloads
                 continue;
+            }
+
+            if (!do2k && !do1k && doSources) {
+                const meta = item.meta || getImageMetadata(mediaId);
+                await downloadUniqueSources(meta);
+                if (cb) cb.checked = false;
+                lastSuccessfulDownload = {
+                    mediaId: mediaId,
+                    filename: `GoogleFlow_sources_${mediaId}`,
+                    time: new Date().toLocaleTimeString()
+                };
+                updateSelectedCount();
+                // Instant, zero sleep between source downloads
+                continue;
+            }
+
+            if (doSources) {
+                const meta = item.meta || getImageMetadata(mediaId);
+                await downloadUniqueSources(meta);
             }
 
             let success2k = false;

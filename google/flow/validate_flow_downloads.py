@@ -52,6 +52,11 @@ ALT_SIDECAR_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+SOURCE_PATTERN = re.compile(
+    r"^GoogleFlow_Source_(?P<id>[0-9a-zA-Z_-]+)\.(?P<ext>jpg|jpeg|png)$",
+    re.IGNORECASE,
+)
+
 
 def extract_model_from_sidecar(sidecar_path: Path) -> str:
     """Extract model name from sidecar JSON tags or fields."""
@@ -394,6 +399,7 @@ def validate_directory(
 
     # Data structures to aggregate
     items_by_id = defaultdict(dict)
+    source_files = []
     all_matched_files = set()
     total_flow_files = 0
 
@@ -406,6 +412,13 @@ def validate_directory(
             continue
 
         total_flow_files += 1
+
+        # Match unique source images
+        m_src = SOURCE_PATTERN.match(name)
+        if m_src:
+            source_files.append(entry)
+            all_matched_files.add(entry)
+            continue
 
         # Match sidecars first
         m_sc = SIDECAR_PATTERN.match(name)
@@ -536,6 +549,7 @@ def validate_directory(
     print(f"Total Unique Media IDs:          {total_ids}")
     print(f"Total Image Files (.jpg/.png):   {total_images_count}")
     print(f"Total Sidecar Files (.json):     {total_sidecars_count}")
+    print(f"Total Source Images:             {len(source_files)}")
     print(f"Total GoogleFlow Files Found:    {total_flow_files}")
 
     print("\n----------------------------------------------------------------------")
