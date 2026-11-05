@@ -5,10 +5,14 @@
 // @match       https://flow.google.com/project/*
 // @match       https://labs.google/fx/tools/flow/project/*
 // @grant       none
-// @version     2.8.15
+// @version     2.8.16
 // ==/UserScript==
 
 // --- VERSION LOG ---
+// v2.8.16: Dynamic UI Linkage for Resolution & Metadata Controls
+//   - Disables and visually dims the 'Metadata only' checkbox when neither 1K nor 2K is enabled, showing a tooltip explaining that sidecars require a target resolution.
+//   - Re-enables the metadata checkbox whenever 1K or 2K is checked.
+//   - Automatically syncs action button labels to clearly indicate current operating mode (e.g. Sources Only, Meta & Sources, Metadata Only, or Full Download).
 // v2.8.15: Unique Source Images Download & Zero-Delay Metadata/Source Export
 //   - Added 'Download unique sources' option in the control panel to automatically download original ingredient/source images (named GoogleFlow_Source_<UUID>.jpg).
 //   - Deduplicates sources in-memory across the session so each unique source image is downloaded only once.
@@ -692,12 +696,24 @@
         modelInpRow.style.opacity = defaultModelCb.checked ? '1' : '0.4';
     });
 
-    // ---- Update action button labels when download/metadata mode changes ----
-    const updateButtonLabels = () => {
-        const isMeta = cbMetaOnly.checked;
+    // ---- Update action button labels and toggles when options change ----
+    const updateModeUI = () => {
         const do2k = cbDownload2k.checked;
         const do1k = cbDownload1k.checked;
         const doSrc = cbDownloadSources.checked;
+        const canDoMeta = do2k || do1k;
+
+        // If neither 1K nor 2K is enabled, disable the JSON metadata checkbox
+        cbMetaOnly.disabled = !canDoMeta;
+        lblMetaOnly.style.opacity = canDoMeta ? '1' : '0.4';
+        lblMetaOnly.style.cursor = canDoMeta ? 'pointer' : 'not-allowed';
+        cbMetaOnly.style.cursor = canDoMeta ? 'pointer' : 'not-allowed';
+        lblMetaOnly.title = canDoMeta
+            ? ''
+            : 'Enable at least one resolution (1K or 2K) to save metadata sidecars';
+
+        const isMeta = canDoMeta && cbMetaOnly.checked;
+
         if (!window.__is_auto_downloader_running) {
             if (!do2k && !do1k && doSrc) {
                 btnUpscale.textContent = 'Download Sources Only (Selected)';
@@ -716,19 +732,19 @@
     };
     cbMetaOnly.addEventListener('change', () => {
         localStorage.setItem('flow_metadata_only', cbMetaOnly.checked ? 'true' : 'false');
-        updateButtonLabels();
+        updateModeUI();
     });
     cbDownloadSources.addEventListener('change', () => {
         localStorage.setItem('flow_download_sources', cbDownloadSources.checked ? 'true' : 'false');
-        updateButtonLabels();
+        updateModeUI();
     });
     cbDownload1k.addEventListener('change', () => {
-        updateButtonLabels();
+        updateModeUI();
     });
     cbDownload2k.addEventListener('change', () => {
-        updateButtonLabels();
+        updateModeUI();
     });
-    updateButtonLabels();
+    updateModeUI();
 
     // ---- TRASH TOAST NOTIFICATION BLOCKER ----
     cbBlockTrash.addEventListener('change', () => {
@@ -1505,7 +1521,7 @@
         const do2k = cbDownload2k.checked;
         const do1k = cbDownload1k.checked;
         const doSources = cbDownloadSources.checked;
-        const isMetadataOnly = cbMetaOnly.checked;
+        const isMetadataOnly = (do2k || do1k) && cbMetaOnly.checked;
         if (!do2k && !do1k && !doSources) {
             alert("Please enable at least one resolution or download option (2K Upscaled, Default 1K, or Sources).");
             return;
@@ -1879,7 +1895,7 @@
         const do2k = cbDownload2k.checked;
         const do1k = cbDownload1k.checked;
         const doSources = cbDownloadSources.checked;
-        const isMetadataOnly = cbMetaOnly.checked;
+        const isMetadataOnly = (do2k || do1k) && cbMetaOnly.checked;
 
         if (!do2k && !do1k && !doSources) {
             alert("Please enable at least one resolution or download option (2K Upscaled, Default 1K, or Sources).");
