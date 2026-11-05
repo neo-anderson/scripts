@@ -76,6 +76,8 @@ def inspect_json_resolution(json_path: Path) -> str:
             data = json.load(f)
         tags = data.get("tags", [])
         if isinstance(tags, list):
+            if "ai:upscaled" in tags:
+                return "2K"
             for t in tags:
                 if t in ("media:resolution:2k", "media:upscaled:true"):
                     return "2K"
@@ -244,12 +246,19 @@ def plan_renames(
             res, info, allow_derived=allow_derived_sidecars
         )
         if not sc_path:
+            alt_res = "1K" if res == "2K" else "2K"
+            alt_sc = info.get(f"sidecar_{alt_res.lower()}")
+            gen_sc = info.get("generic_sidecar")
+            can_derive = bool((alt_sc and alt_sc.exists()) or (gen_sc and gen_sc.exists()))
             conflicts.append({
                 "type": "missing_sidecar",
                 "source": p,
                 "target": target_path,
                 "short_id": short_id,
-                "details": f"Missing exact {res} sidecar ({sc_status}). Pass --allow-derived-sidecars to cross-derive.",
+                "target_res": res,
+                "can_derive": can_derive,
+                "alt_sidecar": alt_sc or gen_sc,
+                "details": f"Missing exact {res} sidecar ({sc_status}). Pass --allow-derived-sidecars to generate from opposite resolution.",
             })
             continue
 
@@ -349,6 +358,7 @@ def copy_or_create_sidecar(
     plan: dict,
     sidecar_info: dict,
     target_dir: Path,
+    metadata_dir: Path | None = None,
     dry_run: bool = False,
     allow_derived: bool = False,
 ) -> tuple[Path | None, str]:
@@ -366,42 +376,46 @@ def copy_or_create_sidecar(
     if not sc_source or not sc_source.exists():
         return None, desc
 
-    if not dry_run and not target_sidecar.exists():
+    if not dry_run:
         try:
             with open(sc_source, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
-            # Update tags if necessary to reflect target resolution
+            # Update tags to reflect target resolution accurately
             tags = data.get("tags", [])
             if isinstance(tags, list):
                 new_tags = []
-                has_res = False
-                has_upscaled = False
                 for t in tags:
-                    if t.startswith("media:resolution:"):
+                    if t == "ai:upscaled":
+                        # Only keep ai:upscaled if target is 2K
+                        if res == "2K":
+                            new_tags.append(t)
+                    elif t.startswith("media:resolution:"):
                         new_tags.append(f"media:resolution:{res.lower()}")
-                        has_res = True
                     elif t.startswith("media:upscaled:"):
                         new_tags.append(
                             "media:upscaled:true"
                             if res == "2K"
                             else "media:upscaled:false"
                         )
-                        has_upscaled = True
                     else:
                         new_tags.append(t)
-                if not has_res:
-                    new_tags.append(f"media:resolution:{res.lower()}")
-                if not has_upscaled:
-                    new_tags.append(
-                        "media:upscaled:true"
-                        if res == "2K"
-                        else "media:upscaled:false"
-                    )
+
+                if res == "2K" and "ai:upscaled" not in new_tags:
+                    new_tags.append("ai:upscaled")
                 data["tags"] = new_tags
 
-            with open(target_sidecar, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            # Save sidecar in target_dir if not present
+            if not target_sidecar.exists():
+                with open(target_sidecar, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+
+            # Also save in metadata_dir if different and doesn't exist
+            if metadata_dir and metadata_dir.exists() and metadata_dir != target_dir:
+                meta_sidecar = metadata_dir / f"{target_img.name}.json"
+                if not meta_sidecar.exists():
+                    with open(meta_sidecar, "w", encoding="utf-8") as f:
+                        json.dump(data, f, indent=2, ensure_ascii=False)
         except Exception as e:
             print(f"  Warning: failed to write sidecar {target_sidecar.name}: {e}")
             return None, f"error writing sidecar: {e}"
@@ -596,6 +610,29 @@ def main():
         print(f"  • Unmapped / skipped:    {len(unmapped)} file(s)")
     print("----------------------------------------------------------------------")
 
+    # Interactive prompt for derivable sidecars
+    derivable = [c for c in conflicts if c["type"] == "missing_sidecar" and c.get("can_derive")]
+    if derivable and not args.allow_derived_sidecars and not args.dry_run and not args.yes:
+        print(f"\n💡 Notice: {len(derivable)} file(s) are missing exact resolution sidecars, but alternate resolution sidecars exist:")
+        for c in derivable:
+            alt_name = c["alt_sidecar"].name if c.get("alt_sidecar") else "generic"
+            print(f"   • Image: {c['source'].name} ({c['target_res']}) ⟵ Alternate: {alt_name}")
+
+        derive_resp = input(
+            f"\nWould you like to use available 2K sidecars to generate 1K sidecars\n"
+            f"(updating resolution & upscale tags rather than copying directly)? [y/N]: "
+        ).strip().lower()
+        if derive_resp in ("y", "yes"):
+            args.allow_derived_sidecars = True
+            plans, unmapped, conflicts = plan_renames(
+                images_dir,
+                uuid_map,
+                ambiguous_short_ids,
+                allow_overwrite=args.overwrite,
+                allow_derived_sidecars=True,
+            )
+            print(f"\nUpdated Plan: {len(plans)} safe planned renames, {len(conflicts)} remaining conflicts.")
+
     if not plans:
         if conflicts:
             print("\n❌ Cannot proceed: All candidate files have conflicts and cannot be safely renamed.")
@@ -637,6 +674,7 @@ def main():
                     p,
                     info,
                     images_dir,
+                    metadata_dir=metadata_dir,
                     dry_run=False,
                     allow_derived=args.allow_derived_sidecars,
                 )
