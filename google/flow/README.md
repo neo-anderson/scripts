@@ -21,10 +21,13 @@ Violentmonkey userscript for [Google Flow](https://flow.google.com/) that automa
     ],
     "notes": [
       "1.Prompt: Generate a 9x16 photo of a horse with a flowing mane...",
-      "2.Created: Sep 22, 2026"
+      "2.Created: Sep 22, 2026",
+      "3.Source: 307450be-fa88-4b5e-8ecb-e684d07ae4fc, b2099171-fa07-4277-8400-b500c1daf8c2"
     ]
   }
   ```
+- **Source Image ID Tracking**: Automatically extracts source/ingredient image UUIDs from `.ingredients-list` chips and records them under note `"3.Source: <list of IDs>"`.
+- **Metadata-Only Mode**: Toggle `Metadata only (save JSON sidecars only)` to generate and save `.json` sidecars for selected or continuous images without downloading binary image files or triggering 2K GPU upscales.
 - **Continuous Auto-Scroll & Download**: Downloads all visible images on screen, smoothly scrolls down to hydrate the next batch via Angular's virtual scroller, and repeats continuously with a live progress counter.
 - **Graceful Non-2K Model Fallback**: Detects whether an image tile has a direct "Download" button versus a "2K" submenu. If 2K is unsupported for that image, skips 2K without errors and seamlessly downloads the 1K original version.
 - **Selective Batch Downloading**: Select specific image tiles via checkboxes and click "Upscale / Download Selected".

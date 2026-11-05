@@ -5,10 +5,13 @@
 // @match       https://flow.google.com/project/*
 // @match       https://labs.google/fx/tools/flow/project/*
 // @grant       none
-// @version     2.8.13
+// @version     2.8.14
 // ==/UserScript==
 
 // --- VERSION LOG ---
+// v2.8.14: Source Image ID Extraction & Metadata Only Mode
+//   - Extracts source/ingredient image UUIDs from .ingredients-list / flow-ingredient-chip and includes "3.Source: <id1>, <id2>..." in the JSON sidecar notes.
+//   - Added 'Metadata only (save JSON sidecars only)' mode to export .json sidecars for selected or continuous images without downloading binary image files.
 // v2.8.13: "Moved to Trash" Toast Blocker Toggle
 //   - Added a persistent toggle in the floating control panel: 'Block "Moved to trash" toast' (enabled by default).
 //   - Uses a MutationObserver + CSS overlay suppression to instantly hide and auto-dismiss Angular Material trash snackbars.
@@ -80,7 +83,7 @@
 (function() {
     'use strict';
 
-    const SCRIPT_VERSION = 'v2.8.13';
+    const SCRIPT_VERSION = 'v2.8.14';
 
     console.log(`[Auto-Upscaler ${SCRIPT_VERSION}] Script loaded on:`, window.location.href);
 
@@ -445,6 +448,27 @@
     lbl1k.appendChild(cbDownload1k);
     lbl1k.appendChild(document.createTextNode('Download default 1K'));
     dlDiv.appendChild(lbl1k);
+
+    const lblMetaOnly = document.createElement('label');
+    Object.assign(lblMetaOnly.style, {
+        cursor: 'pointer',
+        display: 'flex',
+        alignItems: 'center',
+        gap: '5px',
+        fontSize: '11px',
+        marginTop: '6px',
+        color: '#ffb74d',
+    });
+    const cbMetaOnly = document.createElement('input');
+    cbMetaOnly.type = 'checkbox';
+    cbMetaOnly.id = 'cb-metadata-only';
+    cbMetaOnly.checked = localStorage.getItem('flow_metadata_only') === 'true';
+    cbMetaOnly.style.cursor = 'pointer';
+    cbMetaOnly.style.margin = '0';
+    lblMetaOnly.appendChild(cbMetaOnly);
+    lblMetaOnly.appendChild(document.createTextNode('Metadata only (save JSON sidecars only)'));
+    dlDiv.appendChild(lblMetaOnly);
+
     panelContent.appendChild(dlDiv);
 
     // Toast notifications blocking
@@ -645,6 +669,20 @@
         modelInpRow.style.opacity = defaultModelCb.checked ? '1' : '0.4';
     });
 
+    // ---- Update action button labels when metadata-only mode changes ----
+    const updateButtonLabels = () => {
+        const isMeta = cbMetaOnly.checked;
+        if (!window.__is_auto_downloader_running) {
+            btnUpscale.textContent = isMeta ? 'Save Metadata (Selected)' : 'Upscale / Download Selected';
+            btnDownloadCollection.textContent = isMeta ? 'Auto Scroll & Save Metadata' : 'Auto Scroll & Download Collection';
+        }
+    };
+    cbMetaOnly.addEventListener('change', () => {
+        localStorage.setItem('flow_metadata_only', cbMetaOnly.checked ? 'true' : 'false');
+        updateButtonLabels();
+    });
+    updateButtonLabels();
+
     // ---- TRASH TOAST NOTIFICATION BLOCKER ----
     cbBlockTrash.addEventListener('change', () => {
         localStorage.setItem('flow_block_trash_toast', cbBlockTrash.checked ? 'true' : 'false');
@@ -815,7 +853,7 @@
 
     // ---- METADATA EXTRACTION ----
     function getImageMetadata(mediaId) {
-        const meta = { prompt: '', model: '', created: '' };
+        const meta = { prompt: '', model: '', created: '', sources: [] };
         const img = document.querySelector(`img[data-media-id="${mediaId}"]`) ||
                     document.querySelector(`img[alt="Generated image"][src*="name=${mediaId}"]`) ||
                     document.querySelector(`img[src*="name=${mediaId}"]`) ||
@@ -879,6 +917,24 @@
             }
         }
 
+        // 3. Source / Ingredient Images extraction
+        const sourceIds = [];
+        const ingredientImgs = Array.from(row.querySelectorAll('.ingredients-list img, flow-ingredient-chip img, flow-image-ingredient-chip img, [class*="ingredient"] img'));
+        for (const ingImg of ingredientImgs) {
+            const src = ingImg.src || ingImg.getAttribute('src') || '';
+            const match = src.match(/\/image\/([0-9a-fA-F-]{36})/i) ||
+                          src.match(/\/image\/([0-9a-fA-F-]+)/i) ||
+                          src.match(/name=([0-9a-fA-F-]+)/i) ||
+                          src.match(/([0-9a-fA-F-]{36})/i);
+            if (match && match[1]) {
+                const sid = match[1];
+                if (!sourceIds.includes(sid)) {
+                    sourceIds.push(sid);
+                }
+            }
+        }
+        meta.sources = sourceIds;
+
         return meta;
     }
 
@@ -909,21 +965,28 @@
         return [...new Set(tags)];
     }
 
-    // Build the notes array (conditional, numbered: Prompt first, Created second)
+    // Build the notes array (conditional, numbered: Prompt first, Created second, Source third)
     function buildNotes(meta) {
         const notes = [];
         let n = 1;
         if (meta.prompt)  notes.push(`${n++}.Prompt: ${meta.prompt}`);
         if (meta.created) notes.push(`${n++}.Created: ${meta.created}`);
+        if (meta.sources && meta.sources.length > 0) {
+            notes.push(`${n++}.Source: ${meta.sources.join(', ')}`);
+        }
         return notes;
     }
 
     // Build the grouped .json sidecar
     function buildJson(meta, upscaled) {
-        return JSON.stringify({
+        const obj = {
             tags: buildTags(meta, upscaled),
             notes: buildNotes(meta)
-        }, null, 2);
+        };
+        if (meta.sources && meta.sources.length > 0) {
+            obj.sources = meta.sources;
+        }
+        return JSON.stringify(obj, null, 2);
     }
 
     let reqCounter = 6060000;
@@ -1365,20 +1428,21 @@
     async function runContinuousCollectionDownloader(activeBtn) {
         const do2k = cbDownload2k.checked;
         const do1k = cbDownload1k.checked;
+        const isMetadataOnly = cbMetaOnly.checked;
         if (!do2k && !do1k) {
-            alert("Please enable at least one download option (2K Upscaled or Default 1K).");
+            alert("Please enable at least one resolution option (2K Upscaled or Default 1K).");
             return;
         }
 
         const t = window.__upscale_tokens;
         extractTokensFromWiz();
         const isAuthReady = !!(t.at || t.authToken);
-        if (do1k && !isAuthReady) {
+        if (do1k && !isAuthReady && !isMetadataOnly) {
             alert("Cannot download 1K yet! Wait for Auth token to turn green (✅).");
             return;
         }
 
-        const originalBtnText = 'Auto Scroll & Download Collection';
+        const originalBtnText = isMetadataOnly ? 'Auto Scroll & Save Metadata' : 'Auto Scroll & Download Collection';
         const originalBtnColor = '#4CAF50';
 
         window.__is_auto_downloader_running = true;
@@ -1485,9 +1549,31 @@
                 processedMediaIds.add(mediaId);
                 totalDownloaded++;
 
-                activeBtn.innerText = `Stop (${totalDownloaded} downloaded)`;
-                statusCard.textContent = `Downloaded: ${totalDownloaded - 1} images so far\nCurrently processing: ${mediaId.slice(0, 8)}...`;
-                console.log(`[Auto-Upscaler] Continuous Download #${totalDownloaded}: ${mediaId}`);
+                activeBtn.innerText = isMetadataOnly ? `Stop (${totalDownloaded} meta saved)` : `Stop (${totalDownloaded} downloaded)`;
+                statusCard.textContent = isMetadataOnly
+                    ? `Saved metadata: ${totalDownloaded - 1} images so far\nCurrently processing: ${mediaId.slice(0, 8)}...`
+                    : `Downloaded: ${totalDownloaded - 1} images so far\nCurrently processing: ${mediaId.slice(0, 8)}...`;
+                console.log(`[Auto-Upscaler] Continuous ${isMetadataOnly ? 'Metadata' : 'Download'} #${totalDownloaded}: ${mediaId}`);
+
+                // In Metadata-Only Mode, bypass image downloads and write sidecars directly
+                if (isMetadataOnly) {
+                    const meta = getImageMetadata(mediaId);
+                    if (do2k) {
+                        await writeSidecar(mediaId, `GoogleFlow_2K_${mediaId}.jpg`, true, meta);
+                    }
+                    if (do1k) {
+                        if (do2k) await sleep(200);
+                        await writeSidecar(mediaId, `GoogleFlow_1K_${mediaId}.jpg`, false, meta);
+                    }
+                    lastSuccessfulDownload = {
+                        mediaId: mediaId,
+                        filename: `GoogleFlow_metadata_${mediaId}.json`,
+                        time: new Date().toLocaleTimeString()
+                    };
+                    const offsetMs = computeWaitMs(getSuccessOffset(), 0.2, 0.5);
+                    await sleep(offsetMs);
+                    continue;
+                }
 
                 let success2k = false;
                 let skipped2k = false;
@@ -1656,7 +1742,7 @@
             statusCard.style.backgroundColor = '#1b381b';
             statusCard.style.borderColor = '#4CAF50';
             statusCard.style.color = '#81C784';
-            statusCard.textContent = `✅ Collection complete!\nTotal downloaded: ${totalDownloaded} images.`;
+            statusCard.textContent = `✅ Collection complete!\nTotal ${isMetadataOnly ? 'metadata sidecars saved' : 'downloaded'}: ${totalDownloaded} images.`;
 
             setTimeout(() => {
                 activeBtn.innerText = originalBtnText;
@@ -1677,21 +1763,24 @@
 
         const do2k = cbDownload2k.checked;
         const do1k = cbDownload1k.checked;
+        const isMetadataOnly = cbMetaOnly.checked;
 
         if (!do2k && !do1k) {
-            alert("Please enable at least one download option (2K Upscaled or Default 1K).");
+            alert("Please enable at least one resolution option (2K Upscaled or Default 1K).");
             return;
         }
 
         const t = window.__upscale_tokens;
         extractTokensFromWiz();
         const isAuthReady = !!(t.at || t.authToken);
-        if (do1k && !isAuthReady) {
+        if (do1k && !isAuthReady && !isMetadataOnly) {
             alert("Cannot download 1K yet! Wait for Auth token to turn green (✅).");
             return;
         }
 
-        const originalBtnText = (activeBtn === btnDownloadCollection) ? 'Scan & Download Collection' : 'Upscale / Download Selected';
+        const originalBtnText = isMetadataOnly
+            ? ((activeBtn === btnDownloadCollection) ? 'Auto Scroll & Save Metadata' : 'Save Metadata (Selected)')
+            : ((activeBtn === btnDownloadCollection) ? 'Auto Scroll & Download Collection' : 'Upscale / Download Selected');
         const originalBtnColor = (activeBtn === btnDownloadCollection) ? '#4CAF50' : '#2196F3';
 
         activeBtn.innerText = `Processing 0 / ${itemsList.length}...`;
@@ -1741,8 +1830,36 @@
             const mediaId = item.mediaId;
             const cb = item.checkboxEl || document.querySelector(`.upscaler-checkbox[value="${mediaId}"]`);
             const countLabel = `${i + 1} out of ${itemsList.length}`;
-            activeBtn.innerText = `Processing ${countLabel}...`;
+            activeBtn.innerText = isMetadataOnly ? `Saving meta ${countLabel}...` : `Processing ${countLabel}...`;
             console.log(`[Auto-Upscaler] Processing ${mediaId} (${countLabel})...`);
+
+            if (isMetadataOnly) {
+                const meta = item.meta || getImageMetadata(mediaId);
+                let savedAny = false;
+                if (do2k) {
+                    await writeSidecar(mediaId, `GoogleFlow_2K_${mediaId}.jpg`, true, meta);
+                    console.log(`[Auto-Upscaler] Wrote 2K metadata sidecar for ${mediaId}`);
+                    savedAny = true;
+                }
+                if (do1k) {
+                    if (do2k) await sleep(200);
+                    await writeSidecar(mediaId, `GoogleFlow_1K_${mediaId}.jpg`, false, meta);
+                    console.log(`[Auto-Upscaler] Wrote 1K metadata sidecar for ${mediaId}`);
+                    savedAny = true;
+                }
+                if (savedAny) {
+                    if (cb) cb.checked = false;
+                    lastSuccessfulDownload = {
+                        mediaId: mediaId,
+                        filename: `GoogleFlow_metadata_${mediaId}.json`,
+                        time: new Date().toLocaleTimeString()
+                    };
+                    updateSelectedCount();
+                }
+                const offsetMs = computeWaitMs(getSuccessOffset(), 0.1, 0.3);
+                await sleep(offsetMs);
+                continue;
+            }
 
             let success2k = false;
             let skipped2k = false;
@@ -1908,11 +2025,13 @@
         activeBtn.style.backgroundColor = '#4CAF50';
         activeBtn.disabled = false;
 
-        const finalInfoText = lastSuccessfulDownload ? `${lastSuccessfulDownload.filename} (${lastSuccessfulDownload.time})` : 'All items processed';
+        const finalInfoText = isMetadataOnly
+            ? `Metadata sidecars saved for ${itemsList.length} items.`
+            : (lastSuccessfulDownload ? `${lastSuccessfulDownload.filename} (${lastSuccessfulDownload.time})` : 'All items processed');
         statusCard.style.backgroundColor = '#1b381b';
         statusCard.style.borderColor = '#4CAF50';
         statusCard.style.color = '#81C784';
-        statusCard.textContent = `✅ Completed ${itemsList.length} out of ${itemsList.length} items!\nLast downloaded: ${finalInfoText}`;
+        statusCard.textContent = `✅ Completed ${itemsList.length} out of ${itemsList.length} items!\n${isMetadataOnly ? 'Status: ' : 'Last downloaded: '}${finalInfoText}`;
 
         setTimeout(() => {
             activeBtn.innerText = originalBtnText;

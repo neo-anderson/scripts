@@ -7,6 +7,22 @@ This document records the architectural decisions, reverse-engineering findings,
 
 ## Version History
 
+### v2.8.14 (2026-11-04) — Source Image ID Extraction & Metadata-Only Export Mode
+- **Features & Improvements**:
+  1. **Source / Ingredient Image ID Extraction**:
+     - Automatically parses `.ingredients-list`, `flow-ingredient-chip`, and `flow-image-ingredient-chip` within each row container.
+     - Extracts the source image UUIDs from the image URL (`https://flow-content.google/image/<UUID>?Expires=...`).
+     - Appends source IDs to the structured notes in the `.json` sidecar:
+       `"3.Source: <uuid_1>, <uuid_2>, ..."`
+     - Also includes a dedicated `sources: [...]` array field in the root JSON object for programmatic tools.
+  2. **Metadata-Only Export Mode**:
+     - Added `Metadata only (save JSON sidecars only)` checkbox to the floating control panel (persisted in `localStorage`).
+     - When enabled, dynamically re-labels the action buttons to **"Save Metadata (Selected)"** and **"Auto Scroll & Save Metadata"**.
+     - Bypasses binary image downloads and 2K upscale context menus entirely, instantly generating and downloading `.json` sidecars for selected resolutions (`2K`, `1K`, or both).
+     - Allows fast, lightweight metadata generation across entire collections without consuming bandwidth or waiting for GPU upscales.
+
+---
+
 ### v2.8.13 (2026-11-03) — "Moved to Trash" Toast Blocker Toggle
 - **Problem**:
   - Whenever images or items are deleted or moved to trash in Google Flow, an Angular Material snackbar toast notification (`1 item moved to trash` with "Undo", "View in trash", and "Dismiss" buttons) pops up repeatedly at the bottom of the screen, obscuring tiles and UI elements for several seconds.
