@@ -5,10 +5,14 @@
 // @match       https://flow.google.com/project/*
 // @match       https://labs.google/fx/tools/flow/project/*
 // @grant       none
-// @version     2.8.16
+// @version     2.8.17
 // ==/UserScript==
 
 // --- VERSION LOG ---
+// v2.8.17: Robust Incremental Auto-Scroll Engine
+//   - Fixed a critical scrolling bug where Math.abs(currentTop - lastScrollTop) < 3 evaluated to true on the first scroll, causing an immediate jump to maxScroll and premature termination.
+//   - Replaced fragile bottom-detection jumping with multi-target incremental step scrolling across window, CDK virtual scroll viewports, and parent containers.
+//   - Added 900ms DOM rendering settle time after each viewport advance to allow Angular CDK virtual scroll to reliably mount incoming rows.
 // v2.8.16: Dynamic UI Linkage for Resolution & Metadata Controls
 //   - Disables and visually dims the 'Metadata only' checkbox when neither 1K nor 2K is enabled, showing a tooltip explaining that sidecars require a target resolution.
 //   - Re-enables the metadata checkbox whenever 1K or 2K is checked.
@@ -1411,9 +1415,9 @@
         const v = document.querySelector('cdk-virtual-scroll-viewport');
         if (v && v.scrollHeight > v.clientHeight) return v;
 
-        const vItem = document.querySelector('.virtual-item-container');
-        if (vItem) {
-            let p = vItem.parentElement;
+        const anyTile = document.querySelector('.virtual-item-container, .batch-container, flow-image-tile, flow-tile-container');
+        if (anyTile) {
+            let p = anyTile.parentElement;
             while (p && p !== document.body) {
                 const style = window.getComputedStyle(p);
                 const overflow = style.overflowY || style.overflow;
@@ -1561,11 +1565,59 @@
         const IDLE_COMPLETION_MS = 10000; // 10 seconds of no new images found -> successfully complete collection run
 
         const scroller = findScrollableContainer();
-        const isWindow = (scroller === window || scroller === document.body || scroller === document.documentElement || scroller === document.scrollingElement);
-        const getScrollTop = () => isWindow ? (window.pageYOffset || document.documentElement.scrollTop) : scroller.scrollTop;
-        const setScrollTop = (val, behavior = 'auto') => isWindow ? window.scrollTo({ top: val, behavior }) : scroller.scrollTo({ top: val, behavior });
-        const getScrollHeight = () => isWindow ? document.documentElement.scrollHeight : scroller.scrollHeight;
-        const getClientHeight = () => isWindow ? window.innerHeight : scroller.clientHeight;
+        const getScrollTop = () => {
+            if (scroller && scroller !== window && scroller !== document.body && scroller !== document.documentElement && scroller.scrollTop > 0) {
+                return scroller.scrollTop;
+            }
+            return window.pageYOffset || (document.documentElement ? document.documentElement.scrollTop : 0) || (document.body ? document.body.scrollTop : 0) || 0;
+        };
+        const setScrollTop = (val, behavior = 'auto') => {
+            if (scroller && scroller !== window && scroller !== document.body && scroller !== document.documentElement) {
+                try { scroller.scrollTop = val; } catch (e) {}
+                if (typeof scroller.scrollTo === 'function') {
+                    try { scroller.scrollTo({ top: val, behavior }); } catch (e) {}
+                }
+                scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+            }
+            try { window.scrollTo({ top: val, behavior }); } catch (e) {}
+            if (document.documentElement) document.documentElement.scrollTop = val;
+            if (document.body) document.body.scrollTop = val;
+            window.dispatchEvent(new Event('scroll', { bubbles: true }));
+        };
+        const getClientHeight = () => window.innerHeight || (scroller ? scroller.clientHeight : 800);
+
+        function performScrollStep(step = 320) {
+            // 1. Element scroll
+            if (scroller && scroller !== window && scroller !== document.body && scroller !== document.documentElement) {
+                try {
+                    scroller.scrollTop += step;
+                    if (typeof scroller.scrollBy === 'function') {
+                        scroller.scrollBy({ top: step, behavior: 'smooth' });
+                    }
+                } catch (e) {}
+                scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+            }
+
+            // 2. Window / document scrolling
+            try {
+                window.scrollBy({ top: step, behavior: 'smooth' });
+            } catch (e) {}
+            if (document.documentElement) document.documentElement.scrollTop += step;
+            if (document.body) document.body.scrollTop += step;
+
+            // 3. Any additional scrollable containers in DOM (CDK virtual scroll viewports or main)
+            const candidateScrollables = document.querySelectorAll('cdk-virtual-scroll-viewport, main, flow-collection-view, [class*="project"], [class*="collection"], [class*="grid"]');
+            for (const el of candidateScrollables) {
+                if (el !== scroller && el.scrollHeight > el.clientHeight) {
+                    try {
+                        el.scrollTop += step;
+                        el.dispatchEvent(new Event('scroll', { bubbles: true }));
+                    } catch (e) {}
+                }
+            }
+
+            window.dispatchEvent(new Event('scroll', { bubbles: true }));
+        }
 
         // Rewind to top if currently scrolled down so earlier images aren't skipped
         const initialTop = getScrollTop();
@@ -1573,7 +1625,7 @@
             statusCard.textContent = 'Rewinding to top of collection...';
             console.log(`[Auto-Upscaler] Rewinding to top (from ${initialTop})...`);
             setScrollTop(0, 'auto');
-            await sleep(700);
+            await sleep(800);
         }
 
         function getVisibleUnprocessedTiles() {
@@ -1626,8 +1678,6 @@
 
             return list;
         }
-
-        let lastScrollTop = -1;
 
         while (true) {
             if (window.__stop_auto_downloader) {
@@ -1836,28 +1886,16 @@
             }
 
             const remainingSec = Math.max(1, Math.ceil((IDLE_COMPLETION_MS - idleMs) / 1000));
-            const currentTop = getScrollTop();
-            const maxScroll = Math.max(0, getScrollHeight() - getClientHeight());
 
-            // Safe row step: ~320px (approx 1 row of images, never jumping an entire screen)
-            const step = Math.min(Math.max(Math.floor(getClientHeight() * 0.45), 250), 380);
-            const nextTop = Math.min(currentTop + step, maxScroll);
+            // Advance viewport downwards step-by-step (~320px row step, safe and incremental)
+            const step = Math.min(Math.max(Math.floor(getClientHeight() * 0.45), 260), 380);
+            console.log(`[Auto-Upscaler] Advancing viewport down by ${step}px (idle countdown: ${remainingSec}s)...`);
+            statusCard.textContent = `Downloaded: ${totalDownloaded} | Searching next rows (${remainingSec}s)...`;
 
-            const didNotMove = Math.abs(currentTop - lastScrollTop) < 3;
-            const reachedMax = currentTop >= maxScroll - 25;
+            performScrollStep(step);
 
-            if (didNotMove || reachedMax) {
-                console.log(`[Auto-Upscaler] At bottom boundary (currentTop: ${currentTop}, max: ${maxScroll}). Checking for new tiles (${remainingSec}s remaining)...`);
-                statusCard.textContent = `Downloaded: ${totalDownloaded} | Reached bottom.\nChecking for new tiles (${remainingSec}s before completion)...`;
-                setScrollTop(maxScroll, 'auto');
-                await sleep(800);
-            } else {
-                console.log(`[Auto-Upscaler] Advancing viewport from ${currentTop} to ${nextTop} (max: ${maxScroll})...`);
-                statusCard.textContent = `Downloaded: ${totalDownloaded} | Searching next rows (${remainingSec}s)...`;
-                setScrollTop(nextTop, 'auto');
-                lastScrollTop = currentTop;
-                await sleep(650);
-            }
+            // Wait 900ms to allow Angular CDK virtual scroll to mount newly visible rows
+            await sleep(900);
         }
 
         const wasUserStopped = window.__stop_auto_downloader;
