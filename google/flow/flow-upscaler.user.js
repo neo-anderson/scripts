@@ -699,15 +699,15 @@
         const do1k = cbDownload1k.checked;
         const doSrc = cbDownloadSources.checked;
         if (!window.__is_auto_downloader_running) {
-            if (isMeta && doSrc && !do2k && !do1k) {
-                btnUpscale.textContent = 'Save Meta & Sources (Selected)';
+            if (!do2k && !do1k && doSrc) {
+                btnUpscale.textContent = 'Download Sources Only (Selected)';
+                btnDownloadCollection.textContent = 'Auto Scroll & Download Sources Only';
+            } else if (isMeta && doSrc) {
+                btnUpscale.textContent = 'Save Metadata & Sources (Selected)';
                 btnDownloadCollection.textContent = 'Auto Scroll & Save Meta/Sources';
             } else if (isMeta) {
                 btnUpscale.textContent = 'Save Metadata (Selected)';
                 btnDownloadCollection.textContent = 'Auto Scroll & Save Metadata';
-            } else if (doSrc && !do2k && !do1k) {
-                btnUpscale.textContent = 'Download Sources (Selected)';
-                btnDownloadCollection.textContent = 'Auto Scroll & Download Sources';
             } else {
                 btnUpscale.textContent = 'Upscale / Download Selected';
                 btnDownloadCollection.textContent = 'Auto Scroll & Download Collection';
@@ -1519,9 +1519,11 @@
             return;
         }
 
-        const originalBtnText = isMetadataOnly
-            ? (doSources && !do2k && !do1k ? 'Auto Scroll & Save Meta/Sources' : 'Auto Scroll & Save Metadata')
-            : (doSources && !do2k && !do1k ? 'Auto Scroll & Download Sources' : 'Auto Scroll & Download Collection');
+        const originalBtnText = (!do2k && !do1k && doSources)
+            ? 'Auto Scroll & Download Sources Only'
+            : (isMetadataOnly
+                ? (doSources ? 'Auto Scroll & Save Meta/Sources' : 'Auto Scroll & Save Metadata')
+                : 'Auto Scroll & Download Collection');
         const originalBtnColor = '#4CAF50';
 
         window.__is_auto_downloader_running = true;
@@ -1892,9 +1894,11 @@
             return;
         }
 
-        const originalBtnText = isMetadataOnly
-            ? (doSources && !do2k && !do1k ? ((activeBtn === btnDownloadCollection) ? 'Auto Scroll & Save Meta/Sources' : 'Save Meta & Sources (Selected)') : ((activeBtn === btnDownloadCollection) ? 'Auto Scroll & Save Metadata' : 'Save Metadata (Selected)'))
-            : (doSources && !do2k && !do1k ? ((activeBtn === btnDownloadCollection) ? 'Auto Scroll & Download Sources' : 'Download Sources (Selected)') : ((activeBtn === btnDownloadCollection) ? 'Auto Scroll & Download Collection' : 'Upscale / Download Selected'));
+        const originalBtnText = (!do2k && !do1k && doSources)
+            ? ((activeBtn === btnDownloadCollection) ? 'Auto Scroll & Download Sources Only' : 'Download Sources Only (Selected)')
+            : (isMetadataOnly
+                ? (doSources ? ((activeBtn === btnDownloadCollection) ? 'Auto Scroll & Save Meta/Sources' : 'Save Meta & Sources (Selected)') : ((activeBtn === btnDownloadCollection) ? 'Auto Scroll & Save Metadata' : 'Save Metadata (Selected)'))
+                : ((activeBtn === btnDownloadCollection) ? 'Auto Scroll & Download Collection' : 'Upscale / Download Selected'));
         const originalBtnColor = (activeBtn === btnDownloadCollection) ? '#4CAF50' : '#2196F3';
 
         activeBtn.innerText = `Processing 0 / ${itemsList.length}...`;
