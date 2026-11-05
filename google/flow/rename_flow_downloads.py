@@ -30,11 +30,15 @@ from pathlib import Path
 
 # Regex to extract full UUID from existing sidecars or GoogleFlow files
 SIDECAR_UUID_PATTERN = re.compile(
-    r"GoogleFlow_(?:1K|2K)_(?P<uuid>[0-9a-fA-F-]{36})\.(?:jpg|jpeg|png)?\.?json$",
+    r"^GoogleFlow_(?P<res>1K|2K)_(?P<uuid>[0-9a-fA-F-]{36})\.(?:jpg|jpeg|png)?\.?json$",
+    re.IGNORECASE,
+)
+GENERIC_SIDECAR_PATTERN = re.compile(
+    r"^(?:GoogleFlow_)?(?P<uuid>[0-9a-fA-F-]{36})\.(?:jpg|jpeg|png)?\.?json$",
     re.IGNORECASE,
 )
 GOOGLEFLOW_FILE_PATTERN = re.compile(
-    r"GoogleFlow_(?:1K|2K)_(?P<uuid>[0-9a-fA-F-]{36})\.(?P<ext>jpg|jpeg|png)$",
+    r"^GoogleFlow_(?P<res>1K|2K)_(?P<uuid>[0-9a-fA-F-]{36})\.(?P<ext>jpg|jpeg|png)$",
     re.IGNORECASE,
 )
 
@@ -51,10 +55,46 @@ NATIVE_1K_PATTERN = re.compile(
 )
 
 
+def inspect_json_resolution(json_path: Path) -> str:
+    """
+    Determines resolution ('1K', '2K', or 'unknown') of a JSON sidecar
+    from its filename and its JSON contents (tags).
+    """
+    if not json_path or not json_path.exists():
+        return "unknown"
+
+    name_upper = json_path.name.upper()
+    if "_2K_" in name_upper or name_upper.startswith("GOOGLEFLOW_2K_"):
+        return "2K"
+    if "_1K_" in name_upper or name_upper.startswith("GOOGLEFLOW_1K_"):
+        return "1K"
+
+    # Inspect JSON contents
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        tags = data.get("tags", [])
+        if isinstance(tags, list):
+            for t in tags:
+                if t in ("media:resolution:2k", "media:upscaled:true"):
+                    return "2K"
+                if t in ("media:resolution:1k", "media:upscaled:false"):
+                    return "1K"
+    except Exception:
+        pass
+
+    return "unknown"
+
+
 def build_uuid_map(sidecar_dirs: list[Path]) -> dict[str, dict]:
     """
     Scans directories for sidecars and GoogleFlow files to build a mapping:
-    short_id (lowercase 8-char) -> { 'full_uuid': str, 'sidecar_1k': Path, 'sidecar_2k': Path }
+    short_id (lowercase 8-char) -> {
+        'full_uuid': str,
+        'sidecar_1k': Path | None,
+        'sidecar_2k': Path | None,
+        'generic_sidecar': Path | None
+    }
     """
     uuid_map = {}
 
@@ -69,16 +109,23 @@ def build_uuid_map(sidecar_dirs: list[Path]) -> dict[str, dict]:
             full_uuid = None
             res = None
 
-            # Check sidecar pattern
+            # 1. Check explicit 1K / 2K sidecar pattern
             m_sc = SIDECAR_UUID_PATTERN.match(p.name)
             if m_sc:
                 full_uuid = m_sc.group("uuid").lower()
-                res = "2K" if "_2K_" in p.name.upper() else "1K"
+                res = m_sc.group("res").upper()
             else:
-                m_gf = GOOGLEFLOW_FILE_PATTERN.match(p.name)
-                if m_gf:
-                    full_uuid = m_gf.group("uuid").lower()
-                    res = "2K" if "_2K_" in p.name.upper() else "1K"
+                # 2. Check generic sidecar pattern
+                m_gen = GENERIC_SIDECAR_PATTERN.match(p.name)
+                if m_gen:
+                    full_uuid = m_gen.group("uuid").lower()
+                    res = inspect_json_resolution(p)
+                else:
+                    # 3. Check GoogleFlow image files
+                    m_gf = GOOGLEFLOW_FILE_PATTERN.match(p.name)
+                    if m_gf:
+                        full_uuid = m_gf.group("uuid").lower()
+                        res = m_gf.group("res").upper()
 
             if full_uuid:
                 short_id = full_uuid[:8]
@@ -87,13 +134,17 @@ def build_uuid_map(sidecar_dirs: list[Path]) -> dict[str, dict]:
                         "full_uuid": full_uuid,
                         "sidecar_1k": None,
                         "sidecar_2k": None,
+                        "generic_sidecar": None,
                     }
 
                 if p.name.endswith(".json"):
-                    if res == "1K" and not uuid_map[short_id]["sidecar_1k"]:
-                        uuid_map[short_id]["sidecar_1k"] = p
-                    elif res == "2K" and not uuid_map[short_id]["sidecar_2k"]:
+                    detected_res = inspect_json_resolution(p)
+                    if detected_res == "2K" and not uuid_map[short_id]["sidecar_2k"]:
                         uuid_map[short_id]["sidecar_2k"] = p
+                    elif detected_res == "1K" and not uuid_map[short_id]["sidecar_1k"]:
+                        uuid_map[short_id]["sidecar_1k"] = p
+                    elif not uuid_map[short_id]["generic_sidecar"]:
+                        uuid_map[short_id]["generic_sidecar"] = p
 
     return uuid_map
 
@@ -167,54 +218,88 @@ def plan_renames(
     return plans, unmapped
 
 
+def resolve_sidecar_for_resolution(res: str, sidecar_info: dict) -> tuple[Path | None, str]:
+    """
+    Finds the best sidecar JSON file for the given resolution ("1K" or "2K").
+    Returns (source_path, status_description).
+    Status description explains if it is an exact resolution match or derived.
+    """
+    exact_key = f"sidecar_{res.lower()}"
+    exact_sc = sidecar_info.get(exact_key)
+    if exact_sc and exact_sc.exists():
+        if inspect_json_resolution(exact_sc) == res:
+            return exact_sc, f"exact {res} sidecar match ({exact_sc.name})"
+
+    # If exact resolution sidecar not found, check the alternate resolution to derive from
+    alt_res = "1K" if res == "2K" else "2K"
+    alt_sc = sidecar_info.get(f"sidecar_{alt_res.lower()}")
+    if alt_sc and alt_sc.exists():
+        return alt_sc, f"derived from {alt_res} sidecar ({alt_sc.name}) with tags updated to {res}"
+
+    # Fallback to generic sidecar if present
+    gen_sc = sidecar_info.get("generic_sidecar")
+    if gen_sc and gen_sc.exists():
+        return gen_sc, f"derived from generic sidecar ({gen_sc.name}) with tags updated to {res}"
+
+    return None, "no sidecar found"
+
+
 def copy_or_create_sidecar(
     plan: dict, sidecar_info: dict, target_dir: Path, dry_run: bool = False
-):
+) -> tuple[Path | None, str]:
     """
-    Copies or creates matching sidecar JSON for the renamed file.
+    Copies or creates matching sidecar JSON for the renamed file, ensuring
+    exact resolution matching and tag consistency.
     """
     res = plan["res"]
     target_img = plan["target"]
     target_sidecar = target_dir / f"{target_img.name}.json"
 
-    # Already exists?
-    if target_sidecar.exists():
-        return
+    sc_source, desc = resolve_sidecar_for_resolution(res, sidecar_info)
+    if not sc_source or not sc_source.exists():
+        return None, desc
 
-    sc_source = sidecar_info.get(f"sidecar_{res.lower()}")
-    if not sc_source:
-        # Fallback to 1K sidecar if available
-        sc_source = sidecar_info.get("sidecar_1k") or sidecar_info.get("sidecar_2k")
+    if not dry_run and not target_sidecar.exists():
+        try:
+            with open(sc_source, "r", encoding="utf-8") as f:
+                data = json.load(f)
 
-    if sc_source and sc_source.exists():
-        if not dry_run:
-            try:
-                with open(sc_source, "r", encoding="utf-8") as f:
-                    data = json.load(f)
+            # Update tags if necessary to reflect target resolution
+            tags = data.get("tags", [])
+            if isinstance(tags, list):
+                new_tags = []
+                has_res = False
+                has_upscaled = False
+                for t in tags:
+                    if t.startswith("media:resolution:"):
+                        new_tags.append(f"media:resolution:{res.lower()}")
+                        has_res = True
+                    elif t.startswith("media:upscaled:"):
+                        new_tags.append(
+                            "media:upscaled:true"
+                            if res == "2K"
+                            else "media:upscaled:false"
+                        )
+                        has_upscaled = True
+                    else:
+                        new_tags.append(t)
+                if not has_res:
+                    new_tags.append(f"media:resolution:{res.lower()}")
+                if not has_upscaled:
+                    new_tags.append(
+                        "media:upscaled:true"
+                        if res == "2K"
+                        else "media:upscaled:false"
+                    )
+                data["tags"] = new_tags
 
-                # Update tags if necessary
-                tags = data.get("tags", [])
-                if isinstance(tags, list):
-                    new_tags = []
-                    for t in tags:
-                        if t.startswith("media:resolution:"):
-                            new_tags.append(f"media:resolution:{res.lower()}")
-                        elif t.startswith("media:upscaled:"):
-                            new_tags.append(
-                                "media:upscaled:true"
-                                if res == "2K"
-                                else "media:upscaled:false"
-                            )
-                        else:
-                            new_tags.append(t)
-                    data["tags"] = new_tags
+            with open(target_sidecar, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"  Warning: failed to write sidecar {target_sidecar.name}: {e}")
+            return None, f"error writing sidecar: {e}"
 
-                with open(target_sidecar, "w", encoding="utf-8") as f:
-                    json.dump(data, f, indent=2, ensure_ascii=False)
-            except Exception as e:
-                print(f"  Warning: failed to write sidecar {target_sidecar.name}: {e}")
-        return target_sidecar
-    return None
+    return target_sidecar, desc
 
 
 def main():
@@ -255,6 +340,11 @@ def main():
         action="store_false",
         help="Do not copy or generate sidecars.",
     )
+    parser.add_argument(
+        "--search-parent",
+        action="store_true",
+        help="Also search the parent directory for sidecars.",
+    )
 
     args = parser.parse_args()
     base_dir = Path(args.directory).expanduser().resolve()
@@ -277,9 +367,11 @@ def main():
     print(f"Base Directory:   {base_dir}")
     print(f"Images Directory: {images_dir}")
 
-    # Build UUID map by looking in base_dir, images_dir, and parent dir
-    search_dirs = [base_dir, images_dir]
-    if base_dir.parent.exists():
+    # Build UUID map by looking in base_dir and images_dir
+    search_dirs = [base_dir]
+    if images_dir != base_dir:
+        search_dirs.append(images_dir)
+    if args.search_parent and base_dir.parent.exists():
         search_dirs.append(base_dir.parent)
 
     uuid_map = build_uuid_map(search_dirs)
@@ -303,8 +395,11 @@ def main():
     print(f"Found {len(plans)} files to rename:")
     print("-" * 70)
     for p in plans:
-        print(f"  [OLD] {p['source'].name}")
-        print(f"  [NEW] {p['target'].name} ({p['res']})")
+        info = uuid_map.get(p["short_id"], {})
+        _, sc_status = resolve_sidecar_for_resolution(p["res"], info)
+        print(f"  [{p['res']}] {p['source'].name}")
+        print(f"    ↳ New Image:   {p['target'].name}")
+        print(f"    ↳ Sidecar:     {p['target'].name}.json ({sc_status})")
         print()
 
     if unmapped:
