@@ -25,6 +25,7 @@ import os
 import re
 import shutil
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 
@@ -86,7 +87,9 @@ def inspect_json_resolution(json_path: Path) -> str:
     return "unknown"
 
 
-def build_uuid_map(sidecar_dirs: list[Path]) -> dict[str, dict]:
+def build_uuid_map(
+    sidecar_dirs: list[Path],
+) -> tuple[dict[str, dict], dict[str, list[str]]]:
     """
     Scans directories for sidecars and GoogleFlow files to build a mapping:
     short_id (lowercase 8-char) -> {
@@ -95,8 +98,13 @@ def build_uuid_map(sidecar_dirs: list[Path]) -> dict[str, dict]:
         'sidecar_2k': Path | None,
         'generic_sidecar': Path | None
     }
+    Also returns:
+    ambiguous_short_ids: dict mapping short_id -> list of distinct full_uuids (if collisions occur)
     """
-    uuid_map = {}
+    short_to_uuids = defaultdict(set)
+    uuid_info = defaultdict(
+        lambda: {"sidecar_1k": None, "sidecar_2k": None, "generic_sidecar": None}
+    )
 
     for d in sidecar_dirs:
         if not d.exists() or not d.is_dir():
@@ -129,35 +137,48 @@ def build_uuid_map(sidecar_dirs: list[Path]) -> dict[str, dict]:
 
             if full_uuid:
                 short_id = full_uuid[:8]
-                if short_id not in uuid_map:
-                    uuid_map[short_id] = {
-                        "full_uuid": full_uuid,
-                        "sidecar_1k": None,
-                        "sidecar_2k": None,
-                        "generic_sidecar": None,
-                    }
+                short_to_uuids[short_id].add(full_uuid)
 
                 if p.name.endswith(".json"):
                     detected_res = inspect_json_resolution(p)
-                    if detected_res == "2K" and not uuid_map[short_id]["sidecar_2k"]:
-                        uuid_map[short_id]["sidecar_2k"] = p
-                    elif detected_res == "1K" and not uuid_map[short_id]["sidecar_1k"]:
-                        uuid_map[short_id]["sidecar_1k"] = p
-                    elif not uuid_map[short_id]["generic_sidecar"]:
-                        uuid_map[short_id]["generic_sidecar"] = p
+                    if detected_res == "2K" and not uuid_info[full_uuid]["sidecar_2k"]:
+                        uuid_info[full_uuid]["sidecar_2k"] = p
+                    elif detected_res == "1K" and not uuid_info[full_uuid]["sidecar_1k"]:
+                        uuid_info[full_uuid]["sidecar_1k"] = p
+                    elif not uuid_info[full_uuid]["generic_sidecar"]:
+                        uuid_info[full_uuid]["generic_sidecar"] = p
 
-    return uuid_map
+    # Separate unambiguous short IDs from ambiguous collisions
+    uuid_map = {}
+    ambiguous_short_ids = {}
+
+    for short_id, uuids in short_to_uuids.items():
+        if len(uuids) > 1:
+            ambiguous_short_ids[short_id] = sorted(list(uuids))
+        else:
+            full_uuid = next(iter(uuids))
+            uuid_map[short_id] = {
+                "full_uuid": full_uuid,
+                **uuid_info[full_uuid],
+            }
+
+    return uuid_map, ambiguous_short_ids
 
 
 def plan_renames(
-    images_dir: Path, uuid_map: dict[str, dict]
-) -> tuple[list[dict], list[Path]]:
+    images_dir: Path,
+    uuid_map: dict[str, dict],
+    ambiguous_short_ids: dict[str, list[str]],
+    allow_overwrite: bool = False,
+) -> tuple[list[dict], list[Path], list[dict]]:
     """
-    Plans renames for files in images_dir.
-    Returns (plans, unmapped_files).
+    Plans renames for files in images_dir and detects all conflicts.
+    Returns:
+      (plans, unmapped_files, conflicts)
     """
-    plans = []
+    raw_candidates = []
     unmapped = []
+    conflicts = []
 
     for p in sorted(images_dir.iterdir()):
         if not p.is_file():
@@ -176,19 +197,26 @@ def plan_renames(
         if m2k:
             short_id = m2k.group("short_id").lower()
             ext = m2k.group("ext").lower()
-            if short_id in uuid_map:
+            if short_id in ambiguous_short_ids:
+                conflicts.append({
+                    "type": "ambiguous_id",
+                    "source": p,
+                    "target": None,
+                    "short_id": short_id,
+                    "details": f"Short ID matches multiple UUIDs in sidecars: {', '.join(ambiguous_short_ids[short_id])}",
+                })
+            elif short_id in uuid_map:
                 full_uuid = uuid_map[short_id]["full_uuid"]
                 target_name = f"GoogleFlow_2K_{full_uuid}.{ext}"
-                plans.append(
-                    {
-                        "source": p,
-                        "target": images_dir / target_name,
-                        "res": "2K",
-                        "short_id": short_id,
-                        "full_uuid": full_uuid,
-                        "slug": m2k.group("slug"),
-                    }
-                )
+                target_path = images_dir / target_name
+                raw_candidates.append({
+                    "source": p,
+                    "target": target_path,
+                    "res": "2K",
+                    "short_id": short_id,
+                    "full_uuid": full_uuid,
+                    "slug": m2k.group("slug"),
+                })
             else:
                 unmapped.append(p)
             continue
@@ -198,24 +226,79 @@ def plan_renames(
         if m1k:
             short_id = m1k.group("short_id").lower()
             ext = m1k.group("ext").lower()
-            if short_id in uuid_map:
+            if short_id in ambiguous_short_ids:
+                conflicts.append({
+                    "type": "ambiguous_id",
+                    "source": p,
+                    "target": None,
+                    "short_id": short_id,
+                    "details": f"Short ID matches multiple UUIDs in sidecars: {', '.join(ambiguous_short_ids[short_id])}",
+                })
+            elif short_id in uuid_map:
                 full_uuid = uuid_map[short_id]["full_uuid"]
                 target_name = f"GoogleFlow_1K_{full_uuid}.{ext}"
-                plans.append(
-                    {
-                        "source": p,
-                        "target": images_dir / target_name,
-                        "res": "1K",
-                        "short_id": short_id,
-                        "full_uuid": full_uuid,
-                        "slug": m1k.group("slug"),
-                    }
-                )
+                target_path = images_dir / target_name
+                raw_candidates.append({
+                    "source": p,
+                    "target": target_path,
+                    "res": "1K",
+                    "short_id": short_id,
+                    "full_uuid": full_uuid,
+                    "slug": m1k.group("slug"),
+                })
             else:
                 unmapped.append(p)
             continue
 
-    return plans, unmapped
+    # Cross-check for collisions (multiple sources targeting the same filename)
+    target_groups = defaultdict(list)
+    for c in raw_candidates:
+        target_groups[c["target"]].append(c)
+
+    plans = []
+    for target_path, group in target_groups.items():
+        if len(group) > 1:
+            # Multiple sources mapping to the exact same target filename
+            source_names = [item["source"].name for item in group]
+            for item in group:
+                conflicts.append({
+                    "type": "multiple_sources",
+                    "source": item["source"],
+                    "target": target_path,
+                    "short_id": item["short_id"],
+                    "details": f"Collision: multiple source files target the same name ({', '.join(source_names)})",
+                })
+        else:
+            item = group[0]
+            # Check if destination file already exists on disk
+            if target_path.exists():
+                try:
+                    target_sz = target_path.stat().st_size
+                    source_sz = item["source"].stat().st_size
+                    same_sz = (target_sz == source_sz)
+                    sz_info = (
+                        f"identical size ({source_sz} bytes)"
+                        if same_sz
+                        else f"DIFFERENT sizes (target: {target_sz} bytes vs source: {source_sz} bytes)"
+                    )
+                except Exception:
+                    sz_info = "size unknown"
+
+                if allow_overwrite:
+                    item["will_overwrite"] = True
+                    plans.append(item)
+                else:
+                    conflicts.append({
+                        "type": "destination_exists",
+                        "source": item["source"],
+                        "target": target_path,
+                        "short_id": item["short_id"],
+                        "details": f"Destination file already exists on disk [{sz_info}]. Pass --overwrite to replace.",
+                    })
+            else:
+                plans.append(item)
+
+    return plans, unmapped, conflicts
 
 
 def resolve_sidecar_for_resolution(res: str, sidecar_info: dict) -> tuple[Path | None, str]:
@@ -336,6 +419,11 @@ def main():
         help="Execute renames without interactive prompt.",
     )
     parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Allow overwriting destination files that already exist on disk.",
+    )
+    parser.add_argument(
         "--copy-sidecars",
         action="store_true",
         default=True,
@@ -402,46 +490,94 @@ def main():
     if args.search_parent and base_dir.parent.exists():
         search_dirs.append(base_dir.parent)
 
-    uuid_map = build_uuid_map(search_dirs)
-    print(f"Mapped UUIDs from sidecars: {len(uuid_map)} unique IDs found\n")
+    uuid_map, ambiguous_short_ids = build_uuid_map(search_dirs)
+    print(f"Mapped UUIDs from sidecars: {len(uuid_map)} unique IDs found")
+    if ambiguous_short_ids:
+        print(f"⚠️ Ambiguous short IDs:      {len(ambiguous_short_ids)} ID collisions found")
+    print()
 
     if not uuid_map:
         print("Error: No GoogleFlow sidecar JSON files or reference images found to map short IDs.", file=sys.stderr)
         return 1
 
-    # Plan renames
-    plans, unmapped = plan_renames(images_dir, uuid_map)
+    # Plan renames and detect conflicts
+    plans, unmapped, conflicts = plan_renames(
+        images_dir,
+        uuid_map,
+        ambiguous_short_ids,
+        allow_overwrite=args.overwrite,
+    )
 
-    if not plans:
-        print("No native Flow images found that need renaming.")
-        if unmapped:
-            print(f"\nUnmapped images with 8-char suffix not found in sidecars ({len(unmapped)} files):")
-            for p in unmapped:
-                print(f"  • {p.name}")
-        return 0
+    # 1. Report planned safe renames
+    if plans:
+        print(f"Planned Renames ({len(plans)} file{'s' if len(plans) != 1 else ''}):")
+        print("-" * 70)
+        for p in plans:
+            info = uuid_map.get(p["short_id"], {})
+            _, sc_status = resolve_sidecar_for_resolution(p["res"], info)
+            overwrite_warn = " ⚠️ [OVERWRITE]" if p.get("will_overwrite") else ""
+            print(f"  [{p['res']}] {p['source'].name}")
+            print(f"    ↳ New Image:   {p['target'].name}{overwrite_warn}")
+            print(f"    ↳ Sidecar:     {p['target'].name}.json ({sc_status})")
+            print()
 
-    print(f"Found {len(plans)} files to rename:")
-    print("-" * 70)
-    for p in plans:
-        info = uuid_map.get(p["short_id"], {})
-        _, sc_status = resolve_sidecar_for_resolution(p["res"], info)
-        print(f"  [{p['res']}] {p['source'].name}")
-        print(f"    ↳ New Image:   {p['target'].name}")
-        print(f"    ↳ Sidecar:     {p['target'].name}.json ({sc_status})")
-        print()
+    # 2. Report conflicts & blocking issues
+    if conflicts:
+        print("=" * 70)
+        print(f" ⚠️  CONFLICTS DETECTED ({len(conflicts)} file{'s' if len(conflicts) != 1 else ''} blocked/skipped)")
+        print("=" * 70)
+        for c in conflicts:
+            ctype = c["type"]
+            src_name = c["source"].name
+            tgt_name = c["target"].name if c.get("target") else "N/A"
+            if ctype == "destination_exists":
+                print(f"  [DESTINATION ALREADY EXISTS] {src_name}")
+                print(f"    ↳ Target:  {tgt_name}")
+                print(f"    ↳ Reason:  {c['details']}")
+            elif ctype == "multiple_sources":
+                print(f"  [TARGET COLLISION] Multiple files map to same target: {src_name}")
+                print(f"    ↳ Target:  {tgt_name}")
+                print(f"    ↳ Reason:  {c['details']}")
+            elif ctype == "ambiguous_id":
+                print(f"  [AMBIGUOUS SHORT ID] {src_name}")
+                print(f"    ↳ Reason:  {c['details']}")
+            print()
 
+    # 3. Report unmapped files
     if unmapped:
         print(f"Unmapped files ({len(unmapped)} files):")
         for p in unmapped:
             print(f"  ? {p.name} (short ID not in sidecars)")
         print()
 
+    # 4. Summary table before execution prompt
+    print("----------------------------------------------------------------------")
+    print(" Pre-Execution Summary:")
+    print(f"  • Safe planned renames: {len(plans)} file(s)")
+    if conflicts:
+        print(f"  • Conflicting / blocked: {len(conflicts)} file(s) (will NOT be renamed)")
+    if unmapped:
+        print(f"  • Unmapped / skipped:    {len(unmapped)} file(s)")
+    print("----------------------------------------------------------------------")
+
+    if not plans:
+        if conflicts:
+            print("\n❌ Cannot proceed: All candidate files have conflicts and cannot be safely renamed.")
+            if any(c["type"] == "destination_exists" for c in conflicts):
+                print("💡 Hint: If you intended to replace existing files, pass '--overwrite'.")
+            return 1
+        print("No native Flow images found that need renaming.")
+        return 0
+
     if args.dry_run:
         print("[DRY RUN] No files were renamed.")
         return 0
 
     if not args.yes:
-        resp = input(f"Proceed with renaming {len(plans)} files? [y/N]: ").strip().lower()
+        action_note = f"renaming {len(plans)} file(s)"
+        if any(p.get("will_overwrite") for p in plans):
+            action_note += " (including OVERWRITING existing files)"
+        resp = input(f"\nProceed with {action_note}? [y/N]: ").strip().lower()
         if resp not in ("y", "yes"):
             print("Cancelled.")
             return 0
@@ -454,12 +590,14 @@ def main():
         src = p["source"]
         dst = p["target"]
         try:
+            if p.get("will_overwrite") and dst.exists():
+                dst.unlink()
             src.rename(dst)
             renamed_count += 1
 
             if args.copy_sidecars:
                 info = uuid_map.get(p["short_id"], {})
-                sc = copy_or_create_sidecar(p, info, images_dir, dry_run=False)
+                sc, _ = copy_or_create_sidecar(p, info, images_dir, dry_run=False)
                 if sc:
                     sidecars_created += 1
         except Exception as e:
