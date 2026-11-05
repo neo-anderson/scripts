@@ -5,10 +5,16 @@
 // @match       https://flow.google.com/project/*
 // @match       https://labs.google/fx/tools/flow/project/*
 // @grant       none
-// @version     2.8.17
+// @version     2.8.18
 // ==/UserScript==
 
 // --- VERSION LOG ---
+// v2.8.18: Batch-by-Batch Metadata & Image Collection Engine
+//   - Processes visible generation batches (.batch-container) one batch at a time instead of loose unhydrated tiles.
+//   - Scrolls partially cut-off batches into view and waits until all tile slots (flow-image-tile / flow-tile-container) in the batch hydrate their mediaId and prompt before collecting IDs.
+//   - Extracts batch metadata and builds 1K/2K JSON sidecar payloads once per batch, then writes sidecars for all image IDs in the batch in one go.
+//   - Added 120ms download micro-pacing between sidecar/source downloads so Chromium/Brave never drops back-to-back programmatic downloads.
+//   - Fixed double-scrolling in performScrollStep (removed conflicting scrollTop += step + scrollBy smooth) and slowed viewport advance settle time to 1200ms.
 // v2.8.17: Robust Incremental Auto-Scroll Engine
 //   - Fixed a critical scrolling bug where Math.abs(currentTop - lastScrollTop) < 3 evaluated to true on the first scroll, causing an immediate jump to maxScroll and premature termination.
 //   - Replaced fragile bottom-detection jumping with multi-target incremental step scrolling across window, CDK virtual scroll viewports, and parent containers.
@@ -96,7 +102,7 @@
 (function() {
     'use strict';
 
-    const SCRIPT_VERSION = 'v2.8.14';
+    const SCRIPT_VERSION = 'v2.8.18';
 
     console.log(`[Auto-Upscaler ${SCRIPT_VERSION}] Script loaded on:`, window.location.href);
 
@@ -919,20 +925,18 @@
     }
 
     // ---- METADATA EXTRACTION ----
-    function getImageMetadata(mediaId) {
-        const meta = { prompt: '', model: '', created: '', sources: [] };
-        const img = document.querySelector(`img[data-media-id="${mediaId}"]`) ||
-                    document.querySelector(`img[alt="Generated image"][src*="name=${mediaId}"]`) ||
-                    document.querySelector(`img[src*="name=${mediaId}"]`) ||
-                    document.querySelector(`img[src*="${mediaId}"]`);
-        if (!img) return meta;
+    function getBatchContainer(el) {
+        if (!el) return null;
+        return el.closest('.batch-container') ||
+               el.closest('flow-generation-row') ||
+               el.closest('.virtual-item-container') ||
+               el.closest('[data-item-index]') ||
+               el.closest('div[data-index]') ||
+               el.closest('flow-grid-tile-container');
+    }
 
-        // Climb to the batch / row / tile container of the virtualized grid
-        const row = img.closest('.batch-container') ||
-                    img.closest('.virtual-item-container') ||
-                    img.closest('[data-item-index]') ||
-                    img.closest('div[data-index]') ||
-                    img.closest('flow-grid-tile-container');
+    function extractMetadataFromBatch(row) {
+        const meta = { prompt: '', model: '', created: '', sources: [], sourceItems: [] };
         if (!row) return meta;
 
         // 1. Prompt extraction
@@ -987,7 +991,7 @@
         // 3. Source / Ingredient Images extraction
         const sourceIds = [];
         const sourceItems = [];
-        const batchRoot = img.closest('.batch-container, flow-generation-row, .virtual-item-container, [data-item-index]') || row;
+        const batchRoot = row.closest('.batch-container, flow-generation-row, .virtual-item-container, [data-item-index]') || row;
         const ingredientImgs = Array.from(batchRoot.querySelectorAll('.ingredients-list img, flow-ingredient-chip img, flow-image-ingredient-chip img, [class*="ingredient"] img'));
         for (const ingImg of ingredientImgs) {
             const src = ingImg.src || ingImg.getAttribute('src') || '';
@@ -1007,6 +1011,18 @@
         meta.sourceItems = sourceItems;
 
         return meta;
+    }
+
+    function getImageMetadata(mediaId) {
+        const el = document.querySelector(`img[data-media-id="${mediaId}"]`) ||
+                   document.querySelector(`img[alt="Generated image"][src*="name=${mediaId}"]`) ||
+                   document.querySelector(`img[src*="name=${mediaId}"]`) ||
+                   document.querySelector(`img[src*="${mediaId}"]`) ||
+                   document.querySelector(`.upscaler-checkbox[value="${mediaId}"]`);
+        if (!el) return { prompt: '', model: '', created: '', sources: [], sourceItems: [] };
+
+        const row = getBatchContainer(el);
+        return extractMetadataFromBatch(row);
     }
 
     // Slugify a model name into "ai:model:<slug>", or return null if empty
@@ -1489,10 +1505,11 @@
         setTimeout(() => window.URL.revokeObjectURL(blobUrl), 10000);
     };
 
-    // Writes image-filename.ext.json sidecar using either cached metadata or DOM extraction (instant, zero-sleep)
+    // Writes image-filename.ext.json sidecar using either cached metadata or DOM extraction (with 120ms browser download pacing)
     const writeSidecar = async (mediaId, imageFilename, upscaled, cachedMeta) => {
         const meta = (cachedMeta && cachedMeta.prompt) ? cachedMeta : getImageMetadata(mediaId);
         downloadText(buildJson(meta, upscaled), `${imageFilename}.json`);
+        await sleep(120);
     };
 
     // Deduplicated source images cache (tracked across session)
@@ -1513,10 +1530,10 @@
             try {
                 await downloadUrl(item.url, filename);
                 count++;
+                await sleep(120);
             } catch (e) {
                 console.error(`[Auto-Upscaler] Error downloading source ${item.id}:`, e);
             }
-            // Zero sleep between source downloads
         }
         return count;
     }
@@ -1556,13 +1573,14 @@
         statusCard.style.backgroundColor = '#1a1a1a';
         statusCard.style.borderColor = '#333';
         statusCard.style.color = '#ccc';
-        statusCard.textContent = 'Starting continuous collection download...';
+        statusCard.textContent = 'Starting batch-by-batch collection...';
 
         const processedMediaIds = new Set();
+        const hydratedBatches = new WeakSet();
         let totalDownloaded = 0;
         let lastSuccessfulDownload = null;
         let lastActivityTime = Date.now();
-        const IDLE_COMPLETION_MS = 10000; // 10 seconds of no new images found -> successfully complete collection run
+        const IDLE_COMPLETION_MS = 12000; // 12 seconds of no new batches found -> complete collection run
 
         const scroller = findScrollableContainer();
         const getScrollTop = () => {
@@ -1586,316 +1604,424 @@
         };
         const getClientHeight = () => window.innerHeight || (scroller ? scroller.clientHeight : 800);
 
-        function performScrollStep(step = 320) {
-            // 1. Element scroll
+        function performScrollStep(step = 300) {
+            let scrolledAny = false;
+            // 1. Primary scroller element (instant deterministic step, no double scroll)
             if (scroller && scroller !== window && scroller !== document.body && scroller !== document.documentElement) {
                 try {
-                    scroller.scrollTop += step;
-                    if (typeof scroller.scrollBy === 'function') {
-                        scroller.scrollBy({ top: step, behavior: 'smooth' });
-                    }
+                    const before = scroller.scrollTop;
+                    scroller.scrollTop = before + step;
+                    if (scroller.scrollTop !== before) scrolledAny = true;
+                    scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
                 } catch (e) {}
-                scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
             }
 
-            // 2. Window / document scrolling
-            try {
-                window.scrollBy({ top: step, behavior: 'smooth' });
-            } catch (e) {}
-            if (document.documentElement) document.documentElement.scrollTop += step;
-            if (document.body) document.body.scrollTop += step;
-
-            // 3. Any additional scrollable containers in DOM (CDK virtual scroll viewports or main)
+            // 2. Additional scrollable containers in DOM (CDK virtual scroll viewports or main)
             const candidateScrollables = document.querySelectorAll('cdk-virtual-scroll-viewport, main, flow-collection-view, [class*="project"], [class*="collection"], [class*="grid"]');
             for (const el of candidateScrollables) {
                 if (el !== scroller && el.scrollHeight > el.clientHeight) {
                     try {
-                        el.scrollTop += step;
+                        const before = el.scrollTop;
+                        el.scrollTop = before + step;
+                        if (el.scrollTop !== before) scrolledAny = true;
                         el.dispatchEvent(new Event('scroll', { bubbles: true }));
                     } catch (e) {}
                 }
             }
 
+            // 3. Window / document fallback
+            if (!scrolledAny) {
+                try {
+                    window.scrollBy({ top: step, behavior: 'auto' });
+                } catch (e) {
+                    if (document.documentElement) document.documentElement.scrollTop += step;
+                }
+            }
             window.dispatchEvent(new Event('scroll', { bubbles: true }));
         }
 
-        // Rewind to top if currently scrolled down so earlier images aren't skipped
+        // Rewind to top if currently scrolled down so earlier batches aren't skipped
         const initialTop = getScrollTop();
         if (initialTop > 60) {
             statusCard.textContent = 'Rewinding to top of collection...';
             console.log(`[Auto-Upscaler] Rewinding to top (from ${initialTop})...`);
             setScrollTop(0, 'auto');
-            await sleep(800);
+            await sleep(900);
         }
 
-        function getVisibleUnprocessedTiles() {
-            const list = [];
-            const seenInPass = new Set();
+        function extractMediaIdFromElement(el) {
+            if (!el) return '';
+            const cb = el.classList?.contains('upscaler-checkbox') ? el : el.querySelector?.('.upscaler-checkbox');
+            if (cb && cb.value) return cb.value;
 
-            // 1. Query injected checkboxes (most reliable mediaIds in DOM)
-            const checkboxes = document.querySelectorAll('.upscaler-checkbox');
-            for (const cb of checkboxes) {
-                const mid = cb.value;
-                if (mid && !processedMediaIds.has(mid) && !seenInPass.has(mid)) {
-                    const tile = cb.closest('flow-image-tile') || cb.closest('flow-tile-container') || cb.closest('.container') || cb.parentElement?.parentElement;
-                    if (tile) {
-                        seenInPass.add(mid);
-                        list.push({ mediaId: mid, tile, img: tile.querySelector('img') });
-                    }
-                }
+            if (el.dataset?.mediaId) return el.dataset.mediaId;
+            const dataEl = el.querySelector?.('[data-media-id]');
+            if (dataEl) {
+                const id = dataEl.dataset.mediaId || dataEl.getAttribute('data-media-id');
+                if (id) return id;
             }
 
-            // 2. Query candidate image elements
-            const selector = 'img[data-media-id], flow-image-tile img, img[src*="media.getMediaUrlRedirect"], img[src*="name="], img[alt*="Tile displaying"]';
-            const imgs = document.querySelectorAll(selector);
+            const imgs = el.tagName === 'IMG' ? [el] : Array.from(el.querySelectorAll?.('img') || []);
             for (const img of imgs) {
                 const alt = (img.getAttribute('alt') || '').toLowerCase();
                 if (alt.includes('ingredient')) continue;
+                if (img.closest('.ingredients-list, flow-ingredient-chip, flow-image-ingredient-chip, [class*="ingredient"]')) continue;
 
-                let mid = img.dataset.mediaId || img.getAttribute('data-media-id') || '';
-                if (!mid && img.src) {
-                    const match = img.src.match(/name=([0-9a-f-]+)/i) || img.src.match(/\/([0-9a-f-]{36})/i);
-                    if (match) mid = match[1];
-                }
-                if (mid && !processedMediaIds.has(mid) && !seenInPass.has(mid)) {
-                    const tile = img.closest('flow-image-tile') || img.closest('flow-tile-container') || img.closest('.container') || img.parentElement;
-                    if (tile) {
-                        seenInPass.add(mid);
-                        list.push({ mediaId: mid, tile, img });
-                    }
+                const src = img.src || img.getAttribute('src') || '';
+                if (!src) continue;
+
+                const match = src.match(/name=([0-9a-fA-F-]{36})/i) ||
+                              src.match(/\/image\/([0-9a-fA-F-]{36})/i) ||
+                              src.match(/\/([0-9a-fA-F-]{36})(?:[/?&#]|$)/i) ||
+                              src.match(/name=([0-9a-fA-F-]+)/i);
+                if (match && match[1]) return match[1];
+            }
+            return '';
+        }
+
+        function getTileElementsInBatch(batchEl) {
+            if (!batchEl) return [];
+            let tiles = Array.from(batchEl.querySelectorAll('flow-image-tile'));
+            if (tiles.length === 0) {
+                tiles = Array.from(batchEl.querySelectorAll('flow-tile-container'));
+            }
+            if (tiles.length === 0) {
+                const imgs = Array.from(batchEl.querySelectorAll('img')).filter(img => {
+                    const alt = (img.getAttribute('alt') || '').toLowerCase();
+                    if (alt.includes('ingredient')) return false;
+                    if (img.closest('.ingredients-list, flow-ingredient-chip, flow-image-ingredient-chip, [class*="ingredient"]')) return false;
+                    return true;
+                });
+                tiles = imgs.map(img => img.closest('.container, a') || img.parentElement).filter(Boolean);
+            }
+            return [...new Set(tiles)];
+        }
+
+        function getVisibleUnprocessedBatches() {
+            scanAndInjectTileCheckboxes();
+            const vh = getClientHeight();
+            const rawBatches = Array.from(document.querySelectorAll('.batch-container, flow-generation-row'));
+            const batchCandidates = rawBatches.length > 0
+                ? rawBatches
+                : Array.from(document.querySelectorAll('.virtual-item-container, [data-item-index]'));
+
+            const validBatches = [];
+            const seenBatchEls = new Set();
+
+            for (const batchEl of batchCandidates) {
+                if (seenBatchEls.has(batchEl)) continue;
+                seenBatchEls.add(batchEl);
+
+                const rect = batchEl.getBoundingClientRect();
+                if (rect.height <= 0 || rect.width <= 0) continue;
+                // Only work on batches currently visible in or entering the screen
+                if (rect.bottom < 10 || rect.top > vh + 60) continue;
+
+                const tileEls = getTileElementsInBatch(batchEl);
+                const needsHydration = !hydratedBatches.has(batchEl);
+                const hasUnprocessed = tileEls.some(t => {
+                    const mid = extractMediaIdFromElement(t);
+                    return (!mid && needsHydration) || (mid && !processedMediaIds.has(mid));
+                });
+
+                if (hasUnprocessed || (tileEls.length === 0 && needsHydration)) {
+                    validBatches.push({ batchEl, top: rect.top });
                 }
             }
 
-            // Sort visually: top-to-bottom, then left-to-right
-            list.sort((a, b) => {
-                const rectA = a.tile.getBoundingClientRect();
-                const rectB = b.tile.getBoundingClientRect();
-                if (Math.abs(rectA.top - rectB.top) > 25) {
-                    return rectA.top - rectB.top;
+            // Sort batches top-to-bottom
+            validBatches.sort((a, b) => a.top - b.top);
+            return validBatches.map(b => b.batchEl);
+        }
+
+        async function hydrateAndCollectBatch(batchEl) {
+            if (!batchEl) return { batchEl: null, meta: { prompt: '', model: '', created: '', sources: [], sourceItems: [] }, tiles: [] };
+
+            // 1. If the batch is partially cut off near top or bottom of screen, scroll it into clean view
+            const rect = batchEl.getBoundingClientRect();
+            const vh = getClientHeight();
+            if (rect.top < 40 || rect.bottom > vh - 40) {
+                batchEl.scrollIntoView({ block: 'center', behavior: 'auto' });
+                await sleep(500);
+            }
+
+            // 2. If not yet hydrated, poll up to 2000ms until all tile slots in this batch load their mediaId and prompt
+            if (!hydratedBatches.has(batchEl)) {
+                const startWait = Date.now();
+                while (Date.now() - startWait < 2000) {
+                    scanAndInjectTileCheckboxes();
+                    const tileEls = getTileElementsInBatch(batchEl);
+                    if (tileEls.length > 0) {
+                        const resolvedCount = tileEls.filter(t => !!extractMediaIdFromElement(t)).length;
+                        const metaCheck = extractMetadataFromBatch(batchEl);
+                        if (resolvedCount === tileEls.length && metaCheck.prompt) {
+                            break;
+                        }
+                    }
+                    await sleep(150);
                 }
-                return rectA.left - rectB.left;
+                hydratedBatches.add(batchEl);
+            }
+
+            scanAndInjectTileCheckboxes();
+            const finalTileEls = getTileElementsInBatch(batchEl);
+            const tiles = [];
+            const seenInBatch = new Set();
+
+            for (const tileEl of finalTileEls) {
+                const mid = extractMediaIdFromElement(tileEl);
+                if (mid && !seenInBatch.has(mid)) {
+                    seenInBatch.add(mid);
+                    tiles.push({
+                        mediaId: mid,
+                        tile: tileEl,
+                        img: tileEl.querySelector('img')
+                    });
+                }
+            }
+
+            // Sort tiles in batch top-to-bottom, left-to-right
+            tiles.sort((a, b) => {
+                const rA = a.tile.getBoundingClientRect();
+                const rB = b.tile.getBoundingClientRect();
+                if (Math.abs(rA.top - rB.top) > 25) return rA.top - rB.top;
+                return rA.left - rB.left;
             });
 
-            return list;
+            const meta = extractMetadataFromBatch(batchEl);
+            return { batchEl, meta, tiles };
         }
 
         while (true) {
             if (window.__stop_auto_downloader) {
                 console.log('[Auto-Upscaler] Continuous download stopped by user.');
-                statusCard.textContent = `⏹ Stopped by user.\nTotal downloaded: ${totalDownloaded} images.`;
+                statusCard.textContent = `⏹ Stopped by user.\nTotal processed: ${totalDownloaded} images.`;
                 break;
             }
 
-            const unprocessed = getVisibleUnprocessedTiles();
+            const candidateBatches = getVisibleUnprocessedBatches();
 
-            if (unprocessed.length > 0) {
-                lastActivityTime = Date.now(); // reset idle timer because unprocessed tiles are present
-                const item = unprocessed[0]; // strictly process topmost unprocessed tile!
-                const mediaId = item.mediaId;
+            if (candidateBatches.length > 0) {
+                const topBatchEl = candidateBatches[0];
+                const batchData = await hydrateAndCollectBatch(topBatchEl);
+                const unprocessedInBatch = batchData.tiles.filter(t => !processedMediaIds.has(t.mediaId));
 
-                processedMediaIds.add(mediaId);
-                totalDownloaded++;
+                if (unprocessedInBatch.length > 0) {
+                    lastActivityTime = Date.now();
+                    const batchMeta = batchData.meta;
+                    const batchIdsPreview = unprocessedInBatch.map(t => t.mediaId.slice(0, 8)).join(', ');
+                    console.log(`[Auto-Upscaler] Collected batch (${unprocessedInBatch.length} images): [${batchIdsPreview}] | Prompt: "${(batchMeta.prompt || '').slice(0, 45)}..."`);
 
-                activeBtn.innerText = isMetadataOnly ? `Stop (${totalDownloaded} meta saved)` : `Stop (${totalDownloaded} downloaded)`;
-                statusCard.textContent = isMetadataOnly
-                    ? `Saved metadata: ${totalDownloaded - 1} images so far\nCurrently processing: ${mediaId.slice(0, 8)}...`
-                    : `Downloaded: ${totalDownloaded - 1} images so far\nCurrently processing: ${mediaId.slice(0, 8)}...`;
-                console.log(`[Auto-Upscaler] Continuous ${isMetadataOnly ? 'Metadata' : 'Download'} #${totalDownloaded}: ${mediaId}`);
+                    // --- FAST BATCH MODE: Metadata-Only or Sources-Only ---
+                    if (isMetadataOnly || (!do2k && !do1k && doSources)) {
+                        // Build shared JSON strings once for the entire batch
+                        const batchJson2k = (isMetadataOnly && do2k) ? buildJson(batchMeta, true) : null;
+                        const batchJson1k = (isMetadataOnly && do1k) ? buildJson(batchMeta, false) : null;
 
-                // In Metadata-Only Mode, bypass image downloads and write sidecars directly (zero sleep)
-                if (isMetadataOnly) {
-                    const meta = getImageMetadata(mediaId);
-                    if (do2k) {
-                        await writeSidecar(mediaId, `GoogleFlow_2K_${mediaId}.jpg`, true, meta);
+                        for (let bIdx = 0; bIdx < unprocessedInBatch.length; bIdx++) {
+                            if (window.__stop_auto_downloader) break;
+                            const item = unprocessedInBatch[bIdx];
+                            const mediaId = item.mediaId;
+
+                            processedMediaIds.add(mediaId);
+                            totalDownloaded++;
+
+                            activeBtn.innerText = isMetadataOnly
+                                ? `Stop (${totalDownloaded} meta saved)`
+                                : `Stop (${totalDownloaded} processed)`;
+                            statusCard.textContent = `Batch (${bIdx + 1}/${unprocessedInBatch.length}): [${batchIdsPreview}]\nSaved total: ${totalDownloaded} images`;
+
+                            if (isMetadataOnly) {
+                                if (batchJson2k) {
+                                    downloadText(batchJson2k, `GoogleFlow_2K_${mediaId}.jpg.json`);
+                                    await sleep(120);
+                                }
+                                if (batchJson1k) {
+                                    downloadText(batchJson1k, `GoogleFlow_1K_${mediaId}.jpg.json`);
+                                    await sleep(120);
+                                }
+                            }
+
+                            lastSuccessfulDownload = {
+                                mediaId: mediaId,
+                                filename: isMetadataOnly ? `GoogleFlow_metadata_${mediaId}.json` : `GoogleFlow_sources_${mediaId}`,
+                                time: new Date().toLocaleTimeString()
+                            };
+
+                            const cb = document.querySelector(`.upscaler-checkbox[value="${mediaId}"]`);
+                            const targetOverlay = (cb && cb.parentElement) || item.tile?.querySelector('.upscaler-tile-overlay');
+                            if (targetOverlay) targetOverlay.style.backgroundColor = 'rgba(76, 175, 80, 0.8)';
+                            if (cb) {
+                                cb.checked = false;
+                                updateSelectedCount();
+                            }
+                        }
+
+                        // Download unique sources once for the entire batch
+                        if (doSources && !window.__stop_auto_downloader) {
+                            await downloadUniqueSources(batchMeta);
+                        }
+
+                        lastActivityTime = Date.now();
+                        // Calm settle pause after finishing the batch before moving to the next visible batch
+                        await sleep(350);
+                        continue;
                     }
-                    if (do1k) {
-                        await writeSidecar(mediaId, `GoogleFlow_1K_${mediaId}.jpg`, false, meta);
-                    }
+
+                    // --- FULL IMAGE DOWNLOAD MODE (processes tile-by-tile within the hydrated batch) ---
+                    const item = unprocessedInBatch[0];
+                    const mediaId = item.mediaId;
+
+                    processedMediaIds.add(mediaId);
+                    totalDownloaded++;
+
+                    activeBtn.innerText = `Stop (${totalDownloaded} downloaded)`;
+                    statusCard.textContent = `Downloaded: ${totalDownloaded - 1} images so far\nCurrently processing: ${mediaId.slice(0, 8)}...`;
+                    console.log(`[Auto-Upscaler] Continuous Download #${totalDownloaded}: ${mediaId}`);
+
                     if (doSources) {
-                        await downloadUniqueSources(meta);
+                        await downloadUniqueSources(batchMeta);
                     }
-                    lastSuccessfulDownload = {
-                        mediaId: mediaId,
-                        filename: `GoogleFlow_metadata_${mediaId}.json`,
-                        time: new Date().toLocaleTimeString()
-                    };
-                    const cb = document.querySelector(`.upscaler-checkbox[value="${mediaId}"]`);
-                    const targetOverlay = (cb && cb.parentElement) || item.tile?.querySelector('.upscaler-tile-overlay');
-                    if (targetOverlay) targetOverlay.style.backgroundColor = 'rgba(76, 175, 80, 0.8)';
-                    if (cb) {
-                        cb.checked = false;
-                        updateSelectedCount();
-                    }
-                    // Instant, zero sleep between metadata and source downloads
-                    continue;
-                }
 
-                // If ONLY Sources mode is selected (neither 2K nor 1K checked)
-                if (!do2k && !do1k && doSources) {
-                    const meta = getImageMetadata(mediaId);
-                    await downloadUniqueSources(meta);
-                    lastSuccessfulDownload = {
-                        mediaId: mediaId,
-                        filename: `GoogleFlow_sources_${mediaId}`,
-                        time: new Date().toLocaleTimeString()
-                    };
-                    const cb = document.querySelector(`.upscaler-checkbox[value="${mediaId}"]`);
-                    const targetOverlay = (cb && cb.parentElement) || item.tile?.querySelector('.upscaler-tile-overlay');
-                    if (targetOverlay) targetOverlay.style.backgroundColor = 'rgba(76, 175, 80, 0.8)';
-                    if (cb) {
-                        cb.checked = false;
-                        updateSelectedCount();
-                    }
-                    // Instant, zero sleep between source downloads
-                    continue;
-                }
+                    let success2k = false;
+                    let skipped2k = false;
+                    let success1k = false;
+                    let downloadedFilename = '';
 
-                // If sources requested alongside image downloads, fetch unique sources first without sleep
-                if (doSources) {
-                    const meta = getImageMetadata(mediaId);
-                    await downloadUniqueSources(meta);
-                }
-
-                let success2k = false;
-                let skipped2k = false;
-                let success1k = false;
-                let downloadedFilename = '';
-
-                // 1. Process 2K if requested
-                if (do2k) {
-                    try {
-                        const targetFilename = `GoogleFlow_2K_${mediaId}.jpg`;
-                        const res2k = await triggerNative2KUpscale(mediaId, targetFilename, 60000);
-                        if (res2k && res2k.status === 'skipped_no_2k') {
-                            console.log(`[Auto-Upscaler] Image ${mediaId} does not support 2K upscaling (direct Download button).`);
-                            skipped2k = true;
-                        } else if (res2k && typeof res2k === 'string') {
-                            downloadedFilename = res2k;
-                            console.log(`[Auto-Upscaler] 2K Success for ${mediaId}: ${downloadedFilename}`);
-                            const meta = getImageMetadata(mediaId);
-                            await writeSidecar(mediaId, downloadedFilename, true, meta);
-                            success2k = true;
-                            lastSuccessfulDownload = {
-                                mediaId: mediaId,
-                                filename: downloadedFilename,
-                                time: new Date().toLocaleTimeString()
-                            };
-                        } else {
-                            console.error(`[Auto-Upscaler] 2K Upscale failed for ${mediaId}: No download recorded`);
-                        }
-                    } catch (err2k) {
-                        console.error(`[Auto-Upscaler] 2K Upscale error on ${mediaId}:`, err2k);
-                    }
-                }
-
-                // 2. Process 1K if requested
-                if (do1k) {
-                    if (do2k && !success2k && !skipped2k) {
-                        // 2K failed on an actual error (not a model without 2K support), skip 1K
-                    } else {
+                    // 1. Process 2K if requested
+                    if (do2k) {
                         try {
-                            if (do2k && success2k) {
-                                const interSleep = computeWaitMs(getSuccessOffset(), SUCCESS_WAIT_RAND_MIN, SUCCESS_WAIT_RAND_MAX);
-                                console.log(`[Auto-Upscaler] Inter-resolution throttle — pausing ${interSleep}ms between 2K and 1K for ${mediaId}...`);
-                                await sleep(interSleep);
+                            const targetFilename = `GoogleFlow_2K_${mediaId}.jpg`;
+                            const res2k = await triggerNative2KUpscale(mediaId, targetFilename, 60000);
+                            if (res2k && res2k.status === 'skipped_no_2k') {
+                                console.log(`[Auto-Upscaler] Image ${mediaId} does not support 2K upscaling (direct Download button).`);
+                                skipped2k = true;
+                            } else if (res2k && typeof res2k === 'string') {
+                                downloadedFilename = res2k;
+                                console.log(`[Auto-Upscaler] 2K Success for ${mediaId}: ${downloadedFilename}`);
+                                await writeSidecar(mediaId, downloadedFilename, true, batchMeta);
+                                success2k = true;
+                                lastSuccessfulDownload = {
+                                    mediaId: mediaId,
+                                    filename: downloadedFilename,
+                                    time: new Date().toLocaleTimeString()
+                                };
+                            } else {
+                                console.error(`[Auto-Upscaler] 2K Upscale failed for ${mediaId}: No download recorded`);
                             }
-                            console.log(`[Auto-Upscaler] Downloading 1K default for ${mediaId}...`);
-                            const imageFilename = `GoogleFlow_1K_${mediaId}.jpg`;
-                            let oneKUrl = (window.__media_to_cdn_url && window.__media_to_cdn_url[mediaId]) || null;
-                            if (!oneKUrl && (window.location.hostname.includes('flow.google.com') || t.at)) {
-                                try {
-                                    oneKUrl = await sendBatchExecute1KUrl(mediaId);
-                                } catch (e) {}
-                            }
-                            if (!oneKUrl && item.img && item.img.src) {
-                                oneKUrl = item.img.src.includes('=s') ? item.img.src.replace(/=s\d+[^/]*$/, '=s0') : item.img.src;
-                            }
-                            if (!oneKUrl) {
-                                throw new Error(`Could not determine 1K URL for ${mediaId}`);
-                            }
-                            await downloadUrl(oneKUrl, imageFilename);
-                            const meta = getImageMetadata(mediaId);
-                            await writeSidecar(mediaId, imageFilename, false, meta);
-                            console.log(`[Auto-Upscaler] 1K Success for ${mediaId}`);
-                            success1k = true;
-                            lastSuccessfulDownload = {
-                                mediaId: mediaId,
-                                filename: imageFilename,
-                                time: new Date().toLocaleTimeString()
-                            };
-                        } catch (err1k) {
-                            console.error(`[Auto-Upscaler] 1K Download error on ${mediaId}:`, err1k);
+                        } catch (err2k) {
+                            console.error(`[Auto-Upscaler] 2K Upscale error on ${mediaId}:`, err2k);
                         }
                     }
-                }
 
-                // Handle Failure: Auto-stop immediately
-                const failed2k = do2k && !success2k && (!skipped2k || !do1k);
-                const failed1k = do1k && !success1k;
-                if (failed2k || failed1k) {
+                    // 2. Process 1K if requested
+                    if (do1k) {
+                        if (do2k && !success2k && !skipped2k) {
+                            // 2K failed on an actual error (not a model without 2K support), skip 1K
+                        } else {
+                            try {
+                                if (do2k && success2k) {
+                                    const interSleep = computeWaitMs(getSuccessOffset(), SUCCESS_WAIT_RAND_MIN, SUCCESS_WAIT_RAND_MAX);
+                                    console.log(`[Auto-Upscaler] Inter-resolution throttle — pausing ${interSleep}ms between 2K and 1K for ${mediaId}...`);
+                                    await sleep(interSleep);
+                                }
+                                console.log(`[Auto-Upscaler] Downloading 1K default for ${mediaId}...`);
+                                const imageFilename = `GoogleFlow_1K_${mediaId}.jpg`;
+                                let oneKUrl = (window.__media_to_cdn_url && window.__media_to_cdn_url[mediaId]) || null;
+                                if (!oneKUrl && (window.location.hostname.includes('flow.google.com') || t.at)) {
+                                    try {
+                                        oneKUrl = await sendBatchExecute1KUrl(mediaId);
+                                    } catch (e) {}
+                                }
+                                if (!oneKUrl && item.img && item.img.src) {
+                                    oneKUrl = item.img.src.includes('=s') ? item.img.src.replace(/=s\d+[^/]*$/, '=s0') : item.img.src;
+                                }
+                                if (!oneKUrl) {
+                                    throw new Error(`Could not determine 1K URL for ${mediaId}`);
+                                }
+                                await downloadUrl(oneKUrl, imageFilename);
+                                await writeSidecar(mediaId, imageFilename, false, batchMeta);
+                                console.log(`[Auto-Upscaler] 1K Success for ${mediaId}`);
+                                success1k = true;
+                                lastSuccessfulDownload = {
+                                    mediaId: mediaId,
+                                    filename: imageFilename,
+                                    time: new Date().toLocaleTimeString()
+                                };
+                            } catch (err1k) {
+                                console.error(`[Auto-Upscaler] 1K Download error on ${mediaId}:`, err1k);
+                            }
+                        }
+                    }
+
+                    // Handle Failure: Auto-stop immediately
+                    const failed2k = do2k && !success2k && (!skipped2k || !do1k);
+                    const failed1k = do1k && !success1k;
+                    if (failed2k || failed1k) {
+                        const cb = document.querySelector(`.upscaler-checkbox[value="${mediaId}"]`);
+                        const targetOverlay = (cb && cb.parentElement) || item.tile?.querySelector('.upscaler-tile-overlay');
+                        if (targetOverlay) targetOverlay.style.backgroundColor = 'rgba(244, 67, 54, 0.8)';
+
+                        const lastInfoText = lastSuccessfulDownload
+                            ? `${lastSuccessfulDownload.filename} at ${lastSuccessfulDownload.time}`
+                            : 'None';
+
+                        statusCard.style.backgroundColor = '#3b1818';
+                        statusCard.style.borderColor = '#F44336';
+                        statusCard.style.color = '#ff9999';
+                        statusCard.textContent = `❌ STOPPED ON FAILURE!\nFailed on: ${mediaId.slice(0, 8)} (${failed2k ? '2K failed' : '1K failed'})\nDownloaded so far: ${totalDownloaded - 1}\nLast success: ${lastInfoText}`;
+
+                        activeBtn.innerText = `Stopped (${totalDownloaded - 1} downloaded)`;
+                        activeBtn.style.backgroundColor = '#F44336';
+                        activeBtn.disabled = false;
+                        window.__is_auto_downloader_running = false;
+                        window.__stop_auto_downloader = false;
+                        return;
+                    }
+
+                    // Success visual
                     const cb = document.querySelector(`.upscaler-checkbox[value="${mediaId}"]`);
                     const targetOverlay = (cb && cb.parentElement) || item.tile?.querySelector('.upscaler-tile-overlay');
-                    if (targetOverlay) targetOverlay.style.backgroundColor = 'rgba(244, 67, 54, 0.8)';
+                    if (targetOverlay) targetOverlay.style.backgroundColor = 'rgba(76, 175, 80, 0.8)';
+                    if (cb) {
+                        cb.checked = false;
+                        updateSelectedCount();
+                    }
 
-                    const lastInfoText = lastSuccessfulDownload
-                        ? `${lastSuccessfulDownload.filename} at ${lastSuccessfulDownload.time}`
-                        : 'None';
+                    activeBtn.innerText = `Stop (${totalDownloaded} downloaded)`;
+                    statusCard.style.backgroundColor = '#1a1a1a';
+                    statusCard.style.borderColor = '#333';
+                    statusCard.style.color = '#ccc';
+                    statusCard.textContent = `Downloaded: ${totalDownloaded} images so far\nLast: ${lastSuccessfulDownload ? lastSuccessfulDownload.filename : mediaId.slice(0, 8)}`;
 
-                    statusCard.style.backgroundColor = '#3b1818';
-                    statusCard.style.borderColor = '#F44336';
-                    statusCard.style.color = '#ff9999';
-                    statusCard.textContent = `❌ STOPPED ON FAILURE!\nFailed on: ${mediaId.slice(0, 8)} (${failed2k ? '2K failed' : '1K failed'})\nDownloaded so far: ${totalDownloaded - 1}\nLast success: ${lastInfoText}`;
+                    // Throttle between images
+                    const sleepTime = computeWaitMs(getSuccessOffset(), SUCCESS_WAIT_RAND_MIN, SUCCESS_WAIT_RAND_MAX);
+                    console.log(`[Auto-Upscaler] Success throttle — sleeping for ${sleepTime}ms...`);
+                    await sleep(sleepTime);
 
-                    activeBtn.innerText = `Stopped (${totalDownloaded - 1} downloaded)`;
-                    activeBtn.style.backgroundColor = '#F44336';
-                    activeBtn.disabled = false;
-                    window.__is_auto_downloader_running = false;
-                    window.__stop_auto_downloader = false;
-                    return;
+                    lastActivityTime = Date.now();
+                    continue;
                 }
-
-                // Success visual
-                const cb = document.querySelector(`.upscaler-checkbox[value="${mediaId}"]`);
-                const targetOverlay = (cb && cb.parentElement) || item.tile?.querySelector('.upscaler-tile-overlay');
-                if (targetOverlay) targetOverlay.style.backgroundColor = 'rgba(76, 175, 80, 0.8)';
-                if (cb) {
-                    cb.checked = false;
-                    updateSelectedCount();
-                }
-
-                activeBtn.innerText = `Stop (${totalDownloaded} downloaded)`;
-                statusCard.style.backgroundColor = '#1a1a1a';
-                statusCard.style.borderColor = '#333';
-                statusCard.style.color = '#ccc';
-                statusCard.textContent = `Downloaded: ${totalDownloaded} images so far\nLast: ${lastSuccessfulDownload ? lastSuccessfulDownload.filename : mediaId.slice(0, 8)}`;
-
-                // Throttle between images
-                const sleepTime = computeWaitMs(getSuccessOffset(), SUCCESS_WAIT_RAND_MIN, SUCCESS_WAIT_RAND_MAX);
-                console.log(`[Auto-Upscaler] Success throttle — sleeping for ${sleepTime}ms...`);
-                await sleep(sleepTime);
-
-                lastActivityTime = Date.now(); // reset idle timer after download & throttle completes
-                continue; // Immediately re-evaluate getVisibleUnprocessedTiles()!
             }
 
-            // All visible tiles in current viewport processed!
+            // All visible batches in current viewport processed!
             const idleMs = Date.now() - lastActivityTime;
             if (idleMs >= IDLE_COMPLETION_MS) {
-                console.log(`[Auto-Upscaler] No new images found in ${Math.round(idleMs / 1000)}s — finishing collection as complete.`);
+                console.log(`[Auto-Upscaler] No new batches found in ${Math.round(idleMs / 1000)}s — finishing collection as complete.`);
                 break;
             }
 
             const remainingSec = Math.max(1, Math.ceil((IDLE_COMPLETION_MS - idleMs) / 1000));
 
-            // Advance viewport downwards step-by-step (~320px row step, safe and incremental)
-            const step = Math.min(Math.max(Math.floor(getClientHeight() * 0.45), 260), 380);
-            console.log(`[Auto-Upscaler] Advancing viewport down by ${step}px (idle countdown: ${remainingSec}s)...`);
-            statusCard.textContent = `Downloaded: ${totalDownloaded} | Searching next rows (${remainingSec}s)...`;
+            // Advance viewport downwards calmly by ~280-320px and give Angular 1200ms to mount & hydrate next batch
+            const step = Math.min(Math.max(Math.floor(getClientHeight() * 0.38), 240), 320);
+            console.log(`[Auto-Upscaler] Advancing viewport down by ${step}px to next batch (idle countdown: ${remainingSec}s)...`);
+            statusCard.textContent = `Saved: ${totalDownloaded} | Scrolling to next batch (${remainingSec}s)...`;
 
             performScrollStep(step);
 
-            // Wait 900ms to allow Angular CDK virtual scroll to mount newly visible rows
-            await sleep(900);
+            // Wait 1200ms to allow Angular CDK virtual scroll to mount and hydrate newly visible batch rows
+            await sleep(1200);
         }
 
         const wasUserStopped = window.__stop_auto_downloader;
@@ -2285,15 +2411,11 @@
 
     let lastCheckedBox = null;
 
-    // 1. Scan DOM for generated images and overlay UI directly on them
-    setInterval(() => {
-        mountControlPanel(); // keep panel mounted across SPA route changes & hydration
-        updateStatusUI();   // keep auth and recaptcha indicators synchronized
-        dismissTrashSnackbars(); // auto-suppress trash toasts if enabled
-
+    function scanAndInjectTileCheckboxes() {
         const selector = [
             'img[data-media-id]:not([data-upscaler-injected])',
             'flow-image-tile img:not([data-upscaler-injected])',
+            'flow-tile-container img:not([data-upscaler-injected])',
             'img[src*="media.getMediaUrlRedirect"]:not([data-upscaler-injected])',
             'img[alt="Tile displaying a user\'s image"]:not([data-upscaler-injected])'
         ].join(', ');
@@ -2303,13 +2425,14 @@
             // Only generated images, skip ingredient thumbnails
             const alt = (img.getAttribute('alt') || '').toLowerCase();
             if (alt.includes('ingredient')) return;
+            if (img.closest('.ingredients-list, flow-ingredient-chip, flow-image-ingredient-chip, [class*="ingredient"]')) return;
 
             let mediaId = img.dataset.mediaId || img.getAttribute('data-media-id') || '';
-            if (!mediaId) {
+            if (!mediaId && img.src) {
                 const match = img.src.match(/name=([0-9a-f-]+)/i);
                 if (match) mediaId = match[1];
             }
-            if (!mediaId) {
+            if (!mediaId && img.src) {
                 const match = img.src.match(/\/([0-9a-f-]{36})/i);
                 if (match) mediaId = match[1];
             }
@@ -2337,6 +2460,11 @@
                             img.closest('flow-image-tile') ||
                             img.closest('a') ||
                             img.parentElement;
+            if (!container) return;
+
+            // Avoid duplicate overlays in the same tile container
+            if (container.querySelector(`.upscaler-checkbox[value="${mediaId}"]`)) return;
+
             if (window.getComputedStyle(container).position === 'static') {
                 container.style.position = 'relative';
             }
@@ -2402,6 +2530,14 @@
 
         // Keep the counter accurate even when tiles are added/removed by virtualization
         updateSelectedCount();
+    }
+
+    // 1. Scan DOM for generated images and overlay UI directly on them
+    setInterval(() => {
+        mountControlPanel(); // keep panel mounted across SPA route changes & hydration
+        updateStatusUI();   // keep auth and recaptcha indicators synchronized
+        dismissTrashSnackbars(); // auto-suppress trash toasts if enabled
+        scanAndInjectTileCheckboxes();
     }, 1000);
 
     // 2. Intercept XMLHttpRequest to capture live tokens from Google Flow's native requests
