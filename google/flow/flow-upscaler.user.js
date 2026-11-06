@@ -5,10 +5,13 @@
 // @match       https://flow.google.com/project/*
 // @match       https://labs.google/fx/tools/flow/project/*
 // @grant       none
-// @version     2.8.18
+// @version     2.8.19
 // ==/UserScript==
 
 // --- VERSION LOG ---
+// v2.8.19: Fix "Moved to Trash" Toast Blocker Clicking Undo
+//   - Fixed a bug in processTrashSnackbar where querying button[matsnackbaraction] matched and clicked the snackbar's "Undo" action button, which undid the trash action and restored images to the root of the Flow project.
+//   - Now strictly hides the snackbar overlay visually via CSS without clicking any action button on the toast.
 // v2.8.18: Batch-by-Batch Metadata & Image Collection Engine
 //   - Processes visible generation batches (.batch-container) one batch at a time instead of loose unhydrated tiles.
 //   - Scrolls partially cut-off batches into view and waits until all tile slots (flow-image-tile / flow-tile-container) in the batch hydrate their mediaId and prompt before collecting IDs.
@@ -102,7 +105,7 @@
 (function() {
     'use strict';
 
-    const SCRIPT_VERSION = 'v2.8.18';
+    const SCRIPT_VERSION = 'v2.8.19';
 
     console.log(`[Auto-Upscaler ${SCRIPT_VERSION}] Script loaded on:`, window.location.href);
 
@@ -788,15 +791,9 @@
                 pane.style.setProperty('pointer-events', 'none', 'important');
                 pane.style.setProperty('opacity', '0', 'important');
             }
-
-            // Click "Dismiss" so Angular's snackbar service cleanly pops its queue
-            const dismissBtn = (pane || node).querySelector?.('button[matsnackbaraction]') ||
-                               Array.from((pane || node).querySelectorAll?.('button') || []).find(b => /dismiss/i.test(b.textContent || ''));
-            if (dismissBtn) {
-                try { dismissBtn.click(); } catch (e) {}
-            } else if (pane) {
-                try { pane.remove(); } catch (e) {}
-            }
+            // IMPORTANT: Do NOT click button[matsnackbaraction] here — on the "Moved to trash"
+            // snackbar, that action button is "Undo", which restores the trashed image back to
+            // the root of the Flow project! Hiding the pane via CSS is sufficient.
         }
     }
 
